@@ -1262,20 +1262,58 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
     
     logger.info(f"Generated message link: {message_link}")
     
+    # Find the corresponding image info if this is a reply to a bot image
+    group_number = "Unknown"
+    image_setter = ""
+    
+    if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
+        reply_to_msg_id = update.message.reply_to_message.message_id
+        
+        # Search through forwarded messages to find matching image
+        for img_id, msg_data in forwarded_msgs.items():
+            if msg_data.get('group_a_msg_id') == reply_to_msg_id:
+                group_number = msg_data.get('number', 'Unknown')
+                
+                # Get image info to find who set it
+                try:
+                    image = db.get_image_by_id(img_id)
+                    if image and 'metadata' in image and isinstance(image['metadata'], dict):
+                        set_by_username = image['metadata'].get('set_by_username')
+                        set_by_user_name = image['metadata'].get('set_by_user_name', '')
+                        
+                        if set_by_username:
+                            image_setter = f"@{set_by_username}"
+                        elif set_by_user_name:
+                            image_setter = set_by_user_name
+                        else:
+                            image_setter = "Unknown"
+                    else:
+                        image_setter = "Unknown"
+                except Exception as e:
+                    logger.error(f"Error getting image setter info: {e}")
+                    image_setter = "Unknown"
+                break
+    
     # Format the forwarded message for Group B
     forwarded_message = f"""{chat_title}--{user_display_name}
 内容- {reply_text}
+群：{group_number}
+{image_setter}
 链接- {message_link}"""
+    
+    # Create inline keyboard with 销毁 button
+    keyboard = [[InlineKeyboardButton("销毁", callback_data=f"destroy_reply_{int(time.time())}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Send to all Group B chats
     for group_b_id in GROUP_B_IDS:
         try:
-            safe_send_message(
-                context=context,
+            context.bot.send_message(
                 chat_id=group_b_id,
-                text=forwarded_message
+                text=forwarded_message,
+                reply_markup=reply_markup
             )
-            logger.info(f"Forwarded Group A reply to Group B {group_b_id}")
+            logger.info(f"Forwarded Group A reply to Group B {group_b_id} with destroy button")
         except Exception as e:
             logger.error(f"Error forwarding reply to Group B {group_b_id}: {e}")
     
@@ -1349,6 +1387,16 @@ def button_callback(update: Update, context: CallbackContext) -> None:
     elif data.startswith('released_'):
         # Button already clicked, do nothing
         query.answer("状态已解除")
+        
+    elif data.startswith('destroy_reply_'):
+        # Handle destroy reply button
+        try:
+            # Delete the message immediately
+            query.delete_message()
+            logger.info(f"Destroyed Group A reply message via button click")
+        except Exception as e:
+            logger.error(f"Error destroying message: {e}")
+            query.answer("删除失败")
         
     elif data.startswith('plus_'):
         image_id = data[5:]  # Remove 'plus_' prefix
