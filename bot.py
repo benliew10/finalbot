@@ -1153,9 +1153,27 @@ def handle_all_group_b_messages(update: Update, context: CallbackContext) -> Non
                 
                 logger.info(f"✅ Sent Group B reply '{text}' back to Group A user {forward_data['group_a_user_id']}")
                 
-                # Optionally, remove the tracking after successful reply
-                # del group_a_reply_forwards[reply_msg_id]
-                # save_config_data()
+                # Get the original forwarded message text to preserve formatting during countdown
+                try:
+                    original_text = update.message.reply_to_message.text or "转发消息"
+                except Exception as e:
+                    logger.error(f"Could not get original message text: {e}")
+                    original_text = "转发消息"
+                
+                # Start countdown deletion for the forwarded message
+                schedule_message_deletion_with_countdown(
+                    context=context,
+                    chat_id=chat_id,
+                    message_id=reply_msg_id,
+                    original_text=original_text,
+                    delay_seconds=60
+                )
+                
+                logger.info(f"🕒 Started 60-second countdown deletion for forwarded message {reply_msg_id}")
+                
+                # Remove the tracking after successful reply to prevent duplicate countdowns
+                del group_a_reply_forwards[reply_msg_id] 
+                save_config_data()
                 
             except Exception as e:
                 logger.error(f"❌ Error sending Group B reply back to Group A: {e}")
@@ -3353,6 +3371,61 @@ def schedule_message_deletion(context: CallbackContext, chat_id: int, message_id
             logger.info(f"✅ Successfully scheduled deletion job (fallback) for message {message_id}")
         except Exception as e2:
             logger.error(f"❌ Complete failure to schedule deletion: {e2}")
+
+def schedule_message_deletion_with_countdown(context: CallbackContext, chat_id: int, message_id: int, original_text: str, delay_seconds: int = 60):
+    """Schedule a message for deletion with visual countdown updates."""
+    logger.info(f"Scheduling countdown deletion of message {message_id} in chat {chat_id} in {delay_seconds} seconds")
+    
+    start_time = time.time()
+    update_interval = 10  # Update every 10 seconds
+    
+    def update_countdown(context):
+        try:
+            elapsed = int(time.time() - start_time)
+            remaining = max(0, delay_seconds - elapsed)
+            
+            if remaining <= 0:
+                # Time's up, delete the message
+                try:
+                    context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    logger.info(f"✅ Auto-deleted message {message_id} with countdown completed")
+                except Exception as e:
+                    logger.error(f"❌ Failed to delete message {message_id} after countdown: {e}")
+                return
+            
+            # Update message with countdown
+            countdown_text = f"{original_text}\n\n⏰ 消息将在 {remaining} 秒后删除"
+            
+            try:
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=countdown_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+                logger.info(f"📝 Updated countdown message {message_id}: {remaining}s remaining")
+            except Exception as e:
+                logger.error(f"❌ Failed to update countdown for message {message_id}: {e}")
+                
+            # Schedule next update if there's time remaining
+            if remaining > update_interval:
+                context.job_queue.run_once(update_countdown, update_interval)
+            else:
+                # Schedule final deletion
+                context.job_queue.run_once(update_countdown, remaining + 1)
+                
+        except Exception as e:
+            logger.error(f"❌ Error in countdown update for message {message_id}: {e}")
+    
+    try:
+        # Start the countdown updates
+        context.job_queue.run_once(update_countdown, update_interval)
+        logger.info(f"✅ Successfully started countdown deletion for message {message_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to start countdown deletion for message {message_id}: {e}")
+        # Fallback to regular deletion
+        schedule_message_deletion(context, chat_id, message_id, delay_seconds)
 
 # Simple health check server for Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
