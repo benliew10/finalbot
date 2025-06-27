@@ -73,6 +73,7 @@ SETTINGS_FILE = "bot_settings.json"
 GROUP_B_PERCENTAGES_FILE = "group_b_percentages.json"
 GROUP_B_CLICK_MODE_FILE = "group_b_click_mode.json"
 GROUP_B_AMOUNT_RANGES_FILE = "group_b_amount_ranges.json"
+GROUP_A_REPLY_FORWARDS_FILE = "group_a_reply_forwards.json"
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -91,6 +92,9 @@ group_b_percentages: Dict[int, int] = {}  # Format: {group_b_id: percentage}
 
 # Store Group B amount ranges for filtering triggers from Group A
 group_b_amount_ranges: Dict[int, Dict[str, int]] = {}  # Format: {group_b_id: {"min": min_amount, "max": max_amount}}
+
+# Store Group A reply forwards for two-way communication
+group_a_reply_forwards: Dict[int, Dict] = {}  # Format: {group_b_msg_id: {group_a_chat_id, group_a_user_id, group_a_msg_id, original_reply_msg_id}}
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -194,11 +198,19 @@ def save_config_data():
             logger.info(f"Saved Group B amount ranges to file")
     except Exception as e:
         logger.error(f"Error saving Group B amount ranges: {e}")
+    
+    # Save Group A Reply Forwards
+    try:
+        with open(GROUP_A_REPLY_FORWARDS_FILE, 'w') as f:
+            json.dump(group_a_reply_forwards, f, indent=2)
+            logger.info(f"Saved Group A reply forwards to file")
+    except Exception as e:
+        logger.error(f"Error saving Group A reply forwards: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges, group_a_reply_forwards
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -276,6 +288,18 @@ def load_config_data():
         except Exception as e:
             logger.error(f"Error loading Group B amount ranges: {e}")
             group_b_amount_ranges = {}
+    
+    # Load Group A Reply Forwards
+    if os.path.exists(GROUP_A_REPLY_FORWARDS_FILE):
+        try:
+            with open(GROUP_A_REPLY_FORWARDS_FILE, 'r') as f:
+                reply_forwards_json = json.load(f)
+                # Convert keys back to integers
+                group_a_reply_forwards = {int(msg_id): data for msg_id, data in reply_forwards_json.items()}
+                logger.info(f"Loaded Group A reply forwards from file: {group_a_reply_forwards}")
+        except Exception as e:
+            logger.error(f"Error loading Group A reply forwards: {e}")
+            group_a_reply_forwards = {}
 
 # Check if user is a global admin
 def is_global_admin(user_id):
@@ -1107,12 +1131,38 @@ def handle_all_group_b_messages(update: Update, context: CallbackContext) -> Non
     if plus_numbers:
         logger.info(f"Found numbers with + prefix: {plus_numbers}")
     
-    # Regular handling for other messages
-    # CASE 1: Check if replying to a message
+    # Check if this is a Group B reply to a forwarded Group A message (two-way communication)
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
         logger.info(f"This is a reply to message {reply_msg_id}")
         
+        # First check if this is a reply to a forwarded Group A message
+        if reply_msg_id in group_a_reply_forwards:
+            forward_data = group_a_reply_forwards[reply_msg_id]
+            logger.info(f"Detected Group B reply to forwarded Group A message: {text}")
+            
+            # Send the Group B reply back to the original Group A user
+            try:
+                # Send pure message content back to Group A user
+                safe_send_message(
+                    context=context,
+                    chat_id=forward_data['group_a_chat_id'],
+                    text=text,  # Send the exact message content from Group B user
+                    reply_to_message_id=forward_data['group_a_msg_id']
+                )
+                
+                logger.info(f"✅ Sent Group B reply '{text}' back to Group A user {forward_data['group_a_user_id']}")
+                
+                # Optionally, remove the tracking after successful reply
+                # del group_a_reply_forwards[reply_msg_id]
+                # save_config_data()
+                
+            except Exception as e:
+                logger.error(f"❌ Error sending Group B reply back to Group A: {e}")
+            
+            return
+        
+        # Regular handling for image responses
         # Find if any known message matches this reply ID
         for img_id, data in forwarded_msgs.items():
             if data.get('group_b_msg_id') == reply_msg_id:
@@ -1354,9 +1404,10 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
     
     logger.info(f"Generated message link: {message_link}")
     
-    # Find the corresponding image info if this is a reply to a bot image
+    # Find the corresponding image info and target Group B if this is a reply to a bot image
     group_number = "Unknown"
     image_setter = ""
+    target_group_b_id = None
     
     if update.message.reply_to_message and update.message.reply_to_message.from_user.is_bot:
         reply_to_msg_id = update.message.reply_to_message.message_id
@@ -1365,6 +1416,7 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
         for img_id, msg_data in forwarded_msgs.items():
             if msg_data.get('group_a_msg_id') == reply_to_msg_id:
                 group_number = msg_data.get('number', 'Unknown')
+                target_group_b_id = msg_data.get('group_b_chat_id')  # Get the specific Group B that handled this image
                 
                 # Get image info to find who set it
                 try:
@@ -1386,6 +1438,11 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
                     image_setter = "Unknown"
                 break
     
+    # If no specific Group B found, log error and return
+    if target_group_b_id is None:
+        logger.warning("Could not determine target Group B for Group A reply - message not forwarded")
+        return
+    
     # Format the forwarded message for Group B - make chat title clickable to shorten message
     forwarded_message = f"""[{chat_title}]({message_link})--{user_display_name}
 内容- {reply_text}
@@ -1396,21 +1453,34 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
     keyboard = [[InlineKeyboardButton("销毁", callback_data=f"destroy_reply_{int(time.time())}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Send to all Group B chats
-    for group_b_id in GROUP_B_IDS:
-        try:
-            context.bot.send_message(
-                chat_id=group_b_id,
-                text=forwarded_message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True
-            )
-            logger.info(f"Forwarded Group A reply to Group B {group_b_id} with destroy button and clickable title")
-        except Exception as e:
-            logger.error(f"Error forwarding reply to Group B {group_b_id}: {e}")
+    # Send only to the specific Group B that handled the original image
+    try:
+        sent_message = context.bot.send_message(
+            chat_id=target_group_b_id,
+            text=forwarded_message,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        
+        # Track this forward for two-way communication
+        group_a_reply_forwards[sent_message.message_id] = {
+            'group_a_chat_id': chat_id,
+            'group_a_user_id': user.id,
+            'group_a_msg_id': message_id,
+            'original_reply_msg_id': reply_to_message_id,
+            'group_b_chat_id': target_group_b_id,
+            'timestamp': int(time.time())
+        }
+        
+        # Save the tracking data
+        save_config_data()
+        
+        logger.info(f"Forwarded Group A reply to specific Group B {target_group_b_id} with two-way tracking")
+    except Exception as e:
+        logger.error(f"Error forwarding reply to Group B {target_group_b_id}: {e}")
     
-    logger.info(f"Successfully processed Group A reply and forwarded to Group B chats")
+    logger.info(f"Successfully processed Group A reply and forwarded to Group B {target_group_b_id}")
 
 def button_callback(update: Update, context: CallbackContext) -> None:
     """Handle button callbacks."""
