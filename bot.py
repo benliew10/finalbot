@@ -1141,6 +1141,64 @@ def handle_all_group_b_messages(update: Update, context: CallbackContext) -> Non
             forward_data = group_a_reply_forwards[reply_msg_id]
             logger.info(f"Detected Group B reply to forwarded Group A message: {text}")
             
+            # Check if the current user is the one who set the image (authorization check)
+            current_user = update.effective_user
+            current_username = current_user.username
+            current_user_id = current_user.id
+            
+            # Find the original image that corresponds to this forwarded message
+            # We need to find the image based on the Group A message information
+            original_image_setter_username = None
+            original_image_setter_user_id = None
+            found_image_id = None
+            
+            # Search through forwarded_msgs to find the image that generated this Group A message
+            for img_id, msg_data in forwarded_msgs.items():
+                if (msg_data.get('group_a_chat_id') == forward_data['group_a_chat_id'] and 
+                    msg_data.get('group_a_msg_id') == forward_data['original_reply_msg_id']):
+                    # Found the original image, get the setter information
+                    try:
+                        image = db.get_image_by_id(img_id)
+                        if image and 'metadata' in image and isinstance(image['metadata'], dict):
+                            original_image_setter_username = image['metadata'].get('set_by_username')
+                            original_image_setter_user_id = image['metadata'].get('set_by_user_id')
+                            found_image_id = img_id
+                            logger.info(f"Found original image {img_id} set by: @{original_image_setter_username} (ID: {original_image_setter_user_id})")
+                            break
+                    except Exception as e:
+                        logger.error(f"Error getting image setter info: {e}")
+            
+            # Check if current user is authorized to reply
+            is_authorized = False
+            
+            if found_image_id:
+                # Try matching by username first (most reliable)
+                if original_image_setter_username and current_username:
+                    if current_username == original_image_setter_username:
+                        is_authorized = True
+                        logger.info(f"✅ User @{current_username} authorized by username match")
+                    else:
+                        logger.info(f"❌ Username mismatch: @{current_username} != @{original_image_setter_username}")
+                
+                # Fallback to user ID matching if username check failed
+                elif original_image_setter_user_id and current_user_id:
+                    if current_user_id == original_image_setter_user_id:
+                        is_authorized = True
+                        logger.info(f"✅ User {current_user_id} authorized by user ID match")
+                    else:
+                        logger.info(f"❌ User ID mismatch: {current_user_id} != {original_image_setter_user_id}")
+                
+                # No valid comparison possible
+                else:
+                    logger.warning(f"Cannot verify authorization - insufficient user data")
+            else:
+                logger.warning(f"Could not find original image for forwarded message")
+            
+            # Block unauthorized users
+            if not is_authorized:
+                logger.info(f"🚫 User @{current_username} (ID: {current_user_id}) is not authorized to reply to this forwarded message. Remaining silent.")
+                return
+            
             # Send the Group B reply back to the original Group A user
             try:
                 # Send pure message content back to Group A user
