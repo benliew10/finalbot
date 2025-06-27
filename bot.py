@@ -583,6 +583,38 @@ def get_group_b_for_image(image_id, metadata=None):
         # Return None if no Group B configured
         return None
 
+def get_group_b_for_amount(amount):
+    """Get Group B IDs that can handle the specified amount based on their ranges."""
+    valid_group_bs = []
+    
+    for group_b_id in GROUP_B_IDS:
+        if is_amount_within_group_b_range(group_b_id, amount):
+            valid_group_bs.append(group_b_id)
+    
+    logger.info(f"Group B IDs that can handle amount {amount}: {valid_group_bs}")
+    return valid_group_bs
+
+def create_group_a_info(context, group_a_chat_id, message_id):
+    """Create Group A name and message link for click mode messages."""
+    try:
+        # Get Group A chat information
+        group_a_chat = context.bot.get_chat(group_a_chat_id)
+        group_a_name = group_a_chat.title or f"Group {group_a_chat_id}"
+        
+        # Create message link to Group A
+        # For supergroups, remove -100 prefix from chat ID
+        if str(group_a_chat_id).startswith('-100'):
+            chat_id_for_link = str(group_a_chat_id)[4:]  # Remove -100 prefix
+            message_link = f"https://t.me/c/{chat_id_for_link}/{message_id}"
+        else:
+            # For regular groups, use chat ID as is (though this is rare)
+            message_link = f"https://t.me/c/{abs(group_a_chat_id)}/{message_id}"
+        
+        return group_a_name, message_link
+    except Exception as e:
+        logger.error(f"Error getting Group A info: {e}")
+        return f"Group {group_a_chat_id}", None
+
 def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     """Handle messages in Group A."""
     # Add debug logging
@@ -691,25 +723,55 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     
     logger.info(f"Selected image: {image['image_id']}")
     
-    # Get metadata and target Group B BEFORE sending image to Group A
+    # Get metadata for the image
     metadata = image.get('metadata', {})
     logger.info(f"Image metadata: {metadata}")
     
-    # Get the proper Group B ID for this image - this is the critical part
-    target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
-    logger.info(f"Target Group B ID for forwarding: {target_group_b_id}")
+    # FIRST: Find all Group B chats that can handle this amount
+    valid_group_bs = get_group_b_for_amount(amount_int)
     
-    # Check if we have a valid Group B
-    if target_group_b_id is None:
-        logger.error("No Group B configured! Cannot forward message.")
-        update.message.reply_text("Error: No Group B configured. Please ask admin to set up Group B.")
-        return
-    
-    # Check if the amount is within the allowed range for this Group B BEFORE sending anything
-    if not is_amount_within_group_b_range(target_group_b_id, amount_int):
-        logger.info(f"Amount {amount_int} is not within allowed range for Group B {target_group_b_id}. Remaining completely silent.")
+    if not valid_group_bs:
+        logger.info(f"No Group B chats can handle amount {amount_int}. Remaining completely silent.")
         # Set image status back to open since we're not processing it
         db.set_image_status(image['image_id'], "open")
+        return
+    
+    # Get the proper Group B ID for this image from the valid ones
+    target_group_b_id = None
+    
+    # If image already has a Group B mapping, check if it's in the valid list
+    if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
+        try:
+            existing_group_b_id = int(metadata['source_group_b_id'])
+            if existing_group_b_id in valid_group_bs:
+                target_group_b_id = existing_group_b_id
+                logger.info(f"Using existing Group B mapping {target_group_b_id} (valid for amount {amount_int})")
+            else:
+                logger.info(f"Existing Group B mapping {existing_group_b_id} cannot handle amount {amount_int}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error reading existing Group B mapping: {e}")
+    
+    # If no valid existing mapping, select from valid Group B chats
+    if target_group_b_id is None:
+        # Use deterministic selection from valid Group B chats
+        image_hash = hash(image['image_id'])
+        selected_index = abs(image_hash) % len(valid_group_bs)
+        target_group_b_id = valid_group_bs[selected_index]
+        
+        logger.info(f"Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
+        
+        # Update image metadata with the new mapping
+        updated_metadata = metadata.copy() if isinstance(metadata, dict) else {}
+        updated_metadata['source_group_b_id'] = target_group_b_id
+        db.update_image_metadata(image['image_id'], json.dumps(updated_metadata))
+        logger.info(f"Updated image metadata with Group B mapping: {target_group_b_id}")
+    
+    logger.info(f"Final target Group B ID for forwarding: {target_group_b_id}")
+    
+    # Check if we have a valid Group B (should always be true at this point)
+    if target_group_b_id is None:
+        logger.error("Unexpected: No Group B selected after validation!")
+        update.message.reply_text("Error: No Group B configured. Please ask admin to set up Group B.")
         return
     
     # Send the image
@@ -757,8 +819,21 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
             
             # Prepare message text based on mode
             if is_click_mode:
-                # Click mode: Remove the ❌ text
-                message_text = f"💰 金额：{amount}\n🔢 群：{image['number']}"
+                # Click mode: Make group name clickable to shorten message
+                group_a_name, message_link = create_group_a_info(context, chat_id, sent_msg.message_id)
+                
+                if message_link:
+                    # Make the group name itself clickable - shorter and cleaner
+                    message_text = (f"💰 金额：{amount}\n"
+                                  f"🔢 群：{image['number']}\n"
+                                  f"📍 [{group_a_name}]({message_link})")
+                    logger.info(f"Click mode message with clickable group name: {message_link}")
+                else:
+                    # Fallback to basic message if link creation failed
+                    message_text = (f"💰 金额：{amount}\n"
+                                  f"🔢 群：{image['number']}\n"
+                                  f"📍 {group_a_name}")
+                    logger.warning("Message link creation failed, using fallback format")
             else:
                 # Normal mode: Include the ❌ text
                 message_text = f"💰 金额：{amount}\n🔢 群：{image['number']}\n\n❌ 如果会员10分钟没进群请回复0"
@@ -771,7 +846,9 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
                 forwarded = context.bot.send_message(
                     chat_id=target_group_b_id,
                     text=message_text,
-                    reply_markup=reply_markup
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
                 )
             else:
                 # Send regular message in default mode
@@ -849,17 +926,32 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
             image = db.get_image_by_id(image['image_id'])
             metadata = image.get('metadata', {}) if image else {}
             
-            # Get the proper Group B ID for this image
-            target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
+            # Find valid Group B chats for this amount
+            valid_group_bs = get_group_b_for_amount(int(amount))
             
-            # Check if the amount is within the allowed range for this Group B
-            if not is_amount_within_group_b_range(target_group_b_id, int(amount)):
-                logger.info(f"Amount {amount} is not within allowed range for Group B {target_group_b_id}. Remaining silent.")
+            if not valid_group_bs:
+                logger.info(f"No Group B chats can handle amount {amount}. Remaining silent.")
                 # Set image status back to open since we're not processing it
                 db.set_image_status(image['image_id'], "open")
                 # Remove the pending request
                 del pending_requests[request_msg_id]
                 return
+            
+            # Select appropriate Group B from valid ones
+            target_group_b_id = None
+            if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
+                try:
+                    existing_group_b_id = int(metadata['source_group_b_id'])
+                    if existing_group_b_id in valid_group_bs:
+                        target_group_b_id = existing_group_b_id
+                except (ValueError, TypeError):
+                    pass
+            
+            if target_group_b_id is None:
+                # Select from valid Group B chats
+                image_hash = hash(image['image_id'])
+                selected_index = abs(image_hash) % len(valid_group_bs)
+                target_group_b_id = valid_group_bs[selected_index]
             
             # First send the image to Group A
             # Get user mention who set the image
@@ -1294,12 +1386,11 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
                     image_setter = "Unknown"
                 break
     
-    # Format the forwarded message for Group B
-    forwarded_message = f"""{chat_title}--{user_display_name}
+    # Format the forwarded message for Group B - make chat title clickable to shorten message
+    forwarded_message = f"""[{chat_title}]({message_link})--{user_display_name}
 内容- {reply_text}
 群：{group_number}
-{image_setter}
-链接- {message_link}"""
+{image_setter}"""
     
     # Create inline keyboard with 销毁 button
     keyboard = [[InlineKeyboardButton("销毁", callback_data=f"destroy_reply_{int(time.time())}")]]
@@ -1311,9 +1402,11 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
             context.bot.send_message(
                 chat_id=group_b_id,
                 text=forwarded_message,
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True
             )
-            logger.info(f"Forwarded Group A reply to Group B {group_b_id} with destroy button")
+            logger.info(f"Forwarded Group A reply to Group B {group_b_id} with destroy button and clickable title")
         except Exception as e:
             logger.error(f"Error forwarding reply to Group B {group_b_id}: {e}")
     
