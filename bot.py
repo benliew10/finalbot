@@ -1288,22 +1288,25 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # Get the proper Group B ID for this image from the valid ones
     target_group_b_id = None
     
-    # STRICT IMAGE OWNERSHIP: Images ONLY go back to their original Group B, NEVER to others
+    # STRICT RANGE ENFORCEMENT: Only send if original Group B can handle the amount
     if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
         try:
             existing_group_b_id = int(metadata['source_group_b_id'])
-            # Check if the original Group B still exists
+            # Check if the original Group B still exists AND can handle this amount
             if existing_group_b_id in GROUP_B_IDS:
-                # ALWAYS use original Group B, regardless of ranges
-                target_group_b_id = existing_group_b_id
-                logger.info(f"Using ORIGINAL Group B {target_group_b_id} (strict ownership - image belongs to this group)")
-                
-                # Log if outside range but still using original (this is intentional)
-                if existing_group_b_id not in valid_group_bs:
-                    logger.info(f"Note: Amount {amount_float} is outside Group B {existing_group_b_id} range, but image belongs to this group")
+                if existing_group_b_id in valid_group_bs:
+                    # Original group can handle the amount - use it
+                    target_group_b_id = existing_group_b_id
+                    logger.info(f"Using ORIGINAL Group B {target_group_b_id} (can handle amount {amount_float})")
+                else:
+                    # Original group CANNOT handle the amount - STAY SILENT
+                    logger.info(f"Original Group B {existing_group_b_id} CANNOT handle amount {amount_float} (outside range). STAYING SILENT.")
+                    logger.info(f"Image belongs to Group B {existing_group_b_id} but amount is not in their range. NOT forwarding.")
+                    db.set_image_status(image['image_id'], "open")
+                    return
             else:
                 logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
-                # If original group doesn't exist, stay silent rather than send to wrong group
+                # If original group doesn't exist, stay silent
                 logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
                 db.set_image_status(image['image_id'], "open")
                 return
@@ -1496,23 +1499,27 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 del pending_requests[request_msg_id]
                 return
             
-            # STRICT IMAGE OWNERSHIP: Images ONLY go back to their original Group B, NEVER to others
+            # STRICT RANGE ENFORCEMENT: Only send if original Group B can handle the amount
             target_group_b_id = None
             if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
                 try:
                     existing_group_b_id = int(metadata['source_group_b_id'])
-                    # Check if the original Group B still exists
+                    # Check if the original Group B still exists AND can handle this amount
                     if existing_group_b_id in GROUP_B_IDS:
-                        # ALWAYS use original Group B, regardless of ranges
-                        target_group_b_id = existing_group_b_id
-                        logger.info(f"Using ORIGINAL Group B {target_group_b_id} (strict ownership - image belongs to this group)")
-                        
-                        # Log if outside range but still using original (this is intentional)
-                        if existing_group_b_id not in valid_group_bs:
-                            logger.info(f"Note: Amount {amount} is outside Group B {existing_group_b_id} range, but image belongs to this group")
+                        if existing_group_b_id in valid_group_bs:
+                            # Original group can handle the amount - use it
+                            target_group_b_id = existing_group_b_id
+                            logger.info(f"Using ORIGINAL Group B {target_group_b_id} (can handle amount {amount})")
+                        else:
+                            # Original group CANNOT handle the amount - STAY SILENT
+                            logger.info(f"Original Group B {existing_group_b_id} CANNOT handle amount {amount} (outside range). STAYING SILENT.")
+                            logger.info(f"Image belongs to Group B {existing_group_b_id} but amount is not in their range. NOT forwarding.")
+                            db.set_image_status(image['image_id'], "open")
+                            del pending_requests[request_msg_id]
+                            return
                     else:
                         logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
-                        # If original group doesn't exist, stay silent rather than send to wrong group
+                        # If original group doesn't exist, stay silent
                         logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
                         db.set_image_status(image['image_id'], "open")
                         del pending_requests[request_msg_id]
