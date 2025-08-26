@@ -1288,26 +1288,31 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # Get the proper Group B ID for this image from the valid ones
     target_group_b_id = None
     
-    # If image already has a Group B mapping, check if it's in the valid list
+    # STRICT OWNERSHIP MODE: Always use original Group B if image has one
     if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
         try:
             existing_group_b_id = int(metadata['source_group_b_id'])
-            if existing_group_b_id in valid_group_bs:
+            # Check if the original Group B still exists in our Group B list
+            if existing_group_b_id in GROUP_B_IDS:
                 target_group_b_id = existing_group_b_id
-                logger.info(f"Using existing Group B mapping {target_group_b_id} (valid for amount {amount_float})")
+                logger.info(f"Using original Group B {target_group_b_id} (strict ownership mode)")
+                
+                # Log if original group can't handle the amount (but still use it)
+                if existing_group_b_id not in valid_group_bs:
+                    logger.info(f"Note: Original Group B {existing_group_b_id} cannot handle amount {amount_float} based on ranges, but using strict ownership")
             else:
-                logger.info(f"Existing Group B mapping {existing_group_b_id} cannot handle amount {amount_float}")
+                logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
         except (ValueError, TypeError) as e:
             logger.error(f"Error reading existing Group B mapping: {e}")
     
-    # If no valid existing mapping, select from valid Group B chats
+    # If no valid existing mapping, select from valid Group B chats using ranges
     if target_group_b_id is None:
         # Use deterministic selection from valid Group B chats
         image_hash = hash(image['image_id'])
         selected_index = abs(image_hash) % len(valid_group_bs)
         target_group_b_id = valid_group_bs[selected_index]
         
-        logger.info(f"Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
+        logger.info(f"No original Group B mapping found. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
         
         # Update image metadata with the new mapping
         updated_metadata = metadata.copy() if isinstance(metadata, dict) else {}
@@ -1486,21 +1491,28 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 del pending_requests[request_msg_id]
                 return
             
-            # Select appropriate Group B from valid ones
+            # STRICT OWNERSHIP MODE: Select appropriate Group B (original first)
             target_group_b_id = None
             if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
                 try:
                     existing_group_b_id = int(metadata['source_group_b_id'])
-                    if existing_group_b_id in valid_group_bs:
+                    # Always use original Group B if it exists (strict ownership)
+                    if existing_group_b_id in GROUP_B_IDS:
                         target_group_b_id = existing_group_b_id
+                        logger.info(f"Using original Group B {target_group_b_id} (strict ownership mode)")
+                        
+                        # Log if original group can't handle amount but we're using it anyway
+                        if existing_group_b_id not in valid_group_bs:
+                            logger.info(f"Note: Original Group B {existing_group_b_id} cannot handle amount {amount} based on ranges, but using strict ownership")
                 except (ValueError, TypeError):
                     pass
             
             if target_group_b_id is None:
-                # Select from valid Group B chats
+                # Select from valid Group B chats using ranges
                 image_hash = hash(image['image_id'])
                 selected_index = abs(image_hash) % len(valid_group_bs)
                 target_group_b_id = valid_group_bs[selected_index]
+                logger.info(f"No original Group B mapping. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
             
             # First send the image to Group A
             # Get user mention who set the image
