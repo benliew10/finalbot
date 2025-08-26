@@ -1288,27 +1288,36 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # Get the proper Group B ID for this image from the valid ones
     target_group_b_id = None
     
-    # RANGE-FIRST MODE: Prioritize range compliance over ownership
+    # STRICT IMAGE OWNERSHIP: Images ONLY go back to their original Group B, NEVER to others
     if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
         try:
             existing_group_b_id = int(metadata['source_group_b_id'])
-            # Check if the original Group B can handle this amount (range check)
-            if existing_group_b_id in valid_group_bs:
+            # Check if the original Group B still exists
+            if existing_group_b_id in GROUP_B_IDS:
+                # ALWAYS use original Group B, regardless of ranges
                 target_group_b_id = existing_group_b_id
-                logger.info(f"Using original Group B {target_group_b_id} (can handle amount {amount_float})")
+                logger.info(f"Using ORIGINAL Group B {target_group_b_id} (strict ownership - image belongs to this group)")
+                
+                # Log if outside range but still using original (this is intentional)
+                if existing_group_b_id not in valid_group_bs:
+                    logger.info(f"Note: Amount {amount_float} is outside Group B {existing_group_b_id} range, but image belongs to this group")
             else:
-                logger.info(f"Original Group B {existing_group_b_id} cannot handle amount {amount_float}, will select from valid groups")
+                logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
+                # If original group doesn't exist, stay silent rather than send to wrong group
+                logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
+                db.set_image_status(image['image_id'], "open")
+                return
         except (ValueError, TypeError) as e:
             logger.error(f"Error reading existing Group B mapping: {e}")
     
-    # If original Group B can't handle amount, select from valid Group B chats using ranges
+    # Only if image has NO ownership, select from valid Group B chats using ranges
     if target_group_b_id is None:
-        # Use deterministic selection from valid Group B chats
+        # Use deterministic selection from valid Group B chats for NEW images only
         image_hash = hash(image['image_id'])
         selected_index = abs(image_hash) % len(valid_group_bs)
         target_group_b_id = valid_group_bs[selected_index]
         
-        logger.info(f"Selected Group B {target_group_b_id} from valid range-capable options: {valid_group_bs}")
+        logger.info(f"NEW image with no ownership. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
         
         # Update image metadata with the new mapping
         updated_metadata = metadata.copy() if isinstance(metadata, dict) else {}
@@ -1487,26 +1496,36 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 del pending_requests[request_msg_id]
                 return
             
-            # RANGE-FIRST MODE: Select appropriate Group B (range compliance first)
+            # STRICT IMAGE OWNERSHIP: Images ONLY go back to their original Group B, NEVER to others
             target_group_b_id = None
             if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
                 try:
                     existing_group_b_id = int(metadata['source_group_b_id'])
-                    # Only use original Group B if it can handle the amount (range check)
-                    if existing_group_b_id in valid_group_bs:
+                    # Check if the original Group B still exists
+                    if existing_group_b_id in GROUP_B_IDS:
+                        # ALWAYS use original Group B, regardless of ranges
                         target_group_b_id = existing_group_b_id
-                        logger.info(f"Using original Group B {target_group_b_id} (can handle amount {amount})")
+                        logger.info(f"Using ORIGINAL Group B {target_group_b_id} (strict ownership - image belongs to this group)")
+                        
+                        # Log if outside range but still using original (this is intentional)
+                        if existing_group_b_id not in valid_group_bs:
+                            logger.info(f"Note: Amount {amount} is outside Group B {existing_group_b_id} range, but image belongs to this group")
                     else:
-                        logger.info(f"Original Group B {existing_group_b_id} cannot handle amount {amount}, will select from valid groups")
+                        logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
+                        # If original group doesn't exist, stay silent rather than send to wrong group
+                        logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
+                        db.set_image_status(image['image_id'], "open")
+                        del pending_requests[request_msg_id]
+                        return
                 except (ValueError, TypeError):
                     pass
             
             if target_group_b_id is None:
-                # Select from valid Group B chats using ranges
+                # Select from valid Group B chats using ranges for NEW images only
                 image_hash = hash(image['image_id'])
                 selected_index = abs(image_hash) % len(valid_group_bs)
                 target_group_b_id = valid_group_bs[selected_index]
-                logger.info(f"Selected Group B {target_group_b_id} from valid range-capable options: {valid_group_bs}")
+                logger.info(f"NEW image with no ownership. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
             
             # First send the image to Group A
             # Get user mention who set the image
