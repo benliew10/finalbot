@@ -1288,31 +1288,27 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # Get the proper Group B ID for this image from the valid ones
     target_group_b_id = None
     
-    # STRICT OWNERSHIP MODE: Always use original Group B if image has one
+    # RANGE-FIRST MODE: Prioritize range compliance over ownership
     if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
         try:
             existing_group_b_id = int(metadata['source_group_b_id'])
-            # Check if the original Group B still exists in our Group B list
-            if existing_group_b_id in GROUP_B_IDS:
+            # Check if the original Group B can handle this amount (range check)
+            if existing_group_b_id in valid_group_bs:
                 target_group_b_id = existing_group_b_id
-                logger.info(f"Using original Group B {target_group_b_id} (strict ownership mode)")
-                
-                # Log if original group can't handle the amount (but still use it)
-                if existing_group_b_id not in valid_group_bs:
-                    logger.info(f"Note: Original Group B {existing_group_b_id} cannot handle amount {amount_float} based on ranges, but using strict ownership")
+                logger.info(f"Using original Group B {target_group_b_id} (can handle amount {amount_float})")
             else:
-                logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
+                logger.info(f"Original Group B {existing_group_b_id} cannot handle amount {amount_float}, will select from valid groups")
         except (ValueError, TypeError) as e:
             logger.error(f"Error reading existing Group B mapping: {e}")
     
-    # If no valid existing mapping, select from valid Group B chats using ranges
+    # If original Group B can't handle amount, select from valid Group B chats using ranges
     if target_group_b_id is None:
         # Use deterministic selection from valid Group B chats
         image_hash = hash(image['image_id'])
         selected_index = abs(image_hash) % len(valid_group_bs)
         target_group_b_id = valid_group_bs[selected_index]
         
-        logger.info(f"No original Group B mapping found. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
+        logger.info(f"Selected Group B {target_group_b_id} from valid range-capable options: {valid_group_bs}")
         
         # Update image metadata with the new mapping
         updated_metadata = metadata.copy() if isinstance(metadata, dict) else {}
@@ -1491,19 +1487,17 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 del pending_requests[request_msg_id]
                 return
             
-            # STRICT OWNERSHIP MODE: Select appropriate Group B (original first)
+            # RANGE-FIRST MODE: Select appropriate Group B (range compliance first)
             target_group_b_id = None
             if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
                 try:
                     existing_group_b_id = int(metadata['source_group_b_id'])
-                    # Always use original Group B if it exists (strict ownership)
-                    if existing_group_b_id in GROUP_B_IDS:
+                    # Only use original Group B if it can handle the amount (range check)
+                    if existing_group_b_id in valid_group_bs:
                         target_group_b_id = existing_group_b_id
-                        logger.info(f"Using original Group B {target_group_b_id} (strict ownership mode)")
-                        
-                        # Log if original group can't handle amount but we're using it anyway
-                        if existing_group_b_id not in valid_group_bs:
-                            logger.info(f"Note: Original Group B {existing_group_b_id} cannot handle amount {amount} based on ranges, but using strict ownership")
+                        logger.info(f"Using original Group B {target_group_b_id} (can handle amount {amount})")
+                    else:
+                        logger.info(f"Original Group B {existing_group_b_id} cannot handle amount {amount}, will select from valid groups")
                 except (ValueError, TypeError):
                     pass
             
@@ -1512,7 +1506,7 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 image_hash = hash(image['image_id'])
                 selected_index = abs(image_hash) % len(valid_group_bs)
                 target_group_b_id = valid_group_bs[selected_index]
-                logger.info(f"No original Group B mapping. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
+                logger.info(f"Selected Group B {target_group_b_id} from valid range-capable options: {valid_group_bs}")
             
             # First send the image to Group A
             # Get user mention who set the image
