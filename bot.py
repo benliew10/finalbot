@@ -2845,7 +2845,9 @@ def handle_set_group_image(update: Update, context: CallbackContext) -> None:
     if GROUP_A_IDS:
         target_group_a_id = next(iter(GROUP_A_IDS))
     else:
-        target_group_a_id = GROUP_A_ID
+        # If no Group A is configured, we can't proceed
+        logger.error("No Group A configured for setting image")
+        return
     
     logger.info(f"Setting image target Group A ID: {target_group_a_id}")
     
@@ -4452,7 +4454,7 @@ def handle_remove_group_b_amount_range(update: Update, context: CallbackContext)
         update.message.reply_text("❌ Error removing Group B amount range")
 
 def handle_list_group_b_amount_ranges(update: Update, context: CallbackContext) -> None:
-    """List all Group B amount range settings - ONLY in private chat for global admins."""
+    """List all Group B amount range settings with visual coverage map - ONLY in private chat for global admins."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -4469,27 +4471,113 @@ def handle_list_group_b_amount_ranges(update: Update, context: CallbackContext) 
     try:
         if not group_b_amount_ranges:
             update.message.reply_text(
-                "📋 No Group B amount ranges are configured.\n\n"
-                "💡 All Group B chats will receive images for any amount (20-5000)\n\n"
-                "Use /setgroupbrange to set specific ranges for Group B chats."
+                "📋 **NO RANGES CONFIGURED**\n\n"
+                "All Group B chats currently accept ALL amounts (20-5000)\n\n"
+                "💡 Use `/setgroupbrange <group_id> <min> <max>` to configure ranges\n"
+                "💡 Use `/listgroupb` to see all Group B IDs",
+                parse_mode='Markdown'
             )
             return
         
-        message = "📋 Group B Amount Ranges:\n\n"
+        message = "🎯 **GROUP B RANGE COVERAGE MAP**\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        for group_id, range_config in group_b_amount_ranges.items():
-            min_amount = range_config.get("min", 20)
-            max_amount = range_config.get("max", 5000)
-            message += f"🎯 Group B {group_id}:\n"
-            message += f"   💰 Range: {min_amount} - {max_amount}\n\n"
+        # Sort ranges by minimum amount for better visualization
+        sorted_ranges = sorted(group_b_amount_ranges.items(), key=lambda x: x[1].get("min", 20))
         
-        message += "💡 Group B chats not listed will receive images for any amount (20-5000)\n\n"
-        message += "Commands:\n"
-        message += "• /setgroupbrange <id> <min> <max> - Set range\n"
-        message += "• /removegroupbrange <id> - Remove range\n"
-        message += "• /listgroupb - Show all Group B IDs"
+        # Create visual range map
+        message += "**AMOUNT SPECTRUM (20-5000)**\n"
+        message += "```\n"
         
-        update.message.reply_text(message)
+        # Check for gaps in coverage
+        covered_ranges = []
+        for group_id, range_config in sorted_ranges:
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            covered_ranges.append((min_amt, max_amt))
+        
+        # Find gaps
+        gaps = []
+        last_max = 19
+        for min_amt, max_amt in sorted(covered_ranges):
+            if min_amt > last_max + 1:
+                gaps.append((last_max + 1, min_amt - 1))
+            last_max = max(last_max, max_amt)
+        if last_max < 5000:
+            gaps.append((last_max + 1, 5000))
+        
+        message += "20 ──────────────────────── 5000\n"
+        
+        # Show each range as a bar
+        for i, (group_id, range_config) in enumerate(sorted_ranges, 1):
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            
+            # Calculate bar position (20 chars total)
+            start_pos = int(((min_amt - 20) / 4980) * 26)
+            end_pos = int(((max_amt - 20) / 4980) * 26)
+            bar_length = max(1, end_pos - start_pos)
+            
+            bar = " " * start_pos + "█" * bar_length
+            message += f"{bar[:26]}\n"
+        
+        message += "```\n\n"
+        
+        # Detailed range information
+        message += "**CONFIGURED RANGES:**\n\n"
+        for i, (group_id, range_config) in enumerate(sorted_ranges, 1):
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            span = max_amt - min_amt
+            
+            # Determine overlap with other ranges
+            overlaps = []
+            for other_id, other_range in group_b_amount_ranges.items():
+                if other_id != group_id:
+                    other_min = other_range.get("min", 20)
+                    other_max = other_range.get("max", 5000)
+                    if not (max_amt < other_min or min_amt > other_max):
+                        overlaps.append(str(other_id)[-4:])
+            
+            message += f"**Range #{i}**\n"
+            message += f"📍 Group ID: `{group_id}`\n"
+            message += f"💰 Coverage: **{min_amt} - {max_amt}**\n"
+            message += f"📏 Span: {span} units\n"
+            
+            if overlaps:
+                message += f"⚠️ Overlaps with: {', '.join(overlaps)}\n"
+            
+            message += "\n"
+        
+        # Gap analysis
+        if gaps:
+            message += "⚠️ **UNCOVERED GAPS:**\n"
+            for gap_min, gap_max in gaps:
+                message += f"• {gap_min} - {gap_max} (no Group B will receive)\n"
+            message += "\n"
+        else:
+            message += "✅ **Full spectrum coverage!**\n\n"
+        
+        # Statistics
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "📊 **STATISTICS:**\n"
+        message += f"• Total ranges: {len(group_b_amount_ranges)}\n"
+        message += f"• Coverage gaps: {len(gaps)}\n"
+        
+        # Calculate total coverage
+        total_covered = 0
+        for min_amt, max_amt in covered_ranges:
+            total_covered += (max_amt - min_amt + 1)
+        coverage_percent = min(100, (total_covered / 4981) * 100)
+        message += f"• Coverage: {coverage_percent:.1f}% of spectrum\n\n"
+        
+        # Commands hint
+        message += "💡 **COMMANDS:**\n"
+        message += "• Add range: `/setgroupbrange`\n"
+        message += "• Remove: `/removegroupbrange`\n"
+        message += "• List groups: `/listgroupb`"
+        
+        update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error in handle_list_group_b_amount_ranges: {e}")
@@ -4974,7 +5062,7 @@ def handle_financial_audit(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("❌ 显示财务查账界面时发生错误。")
 
 def handle_list_group_b_ids(update: Update, context: CallbackContext) -> None:
-    """List all Group B IDs - ONLY in private chat for global admins."""
+    """List all Group B IDs with enhanced range visualization - ONLY in private chat for global admins."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -4993,22 +5081,62 @@ def handle_list_group_b_ids(update: Update, context: CallbackContext) -> None:
             update.message.reply_text("📋 No Group B chats are registered.")
             return
         
-        message = "📋 Registered Group B IDs:\n\n"
+        message = "📊 **GROUP B CONFIGURATION STATUS**\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # Count groups with and without ranges
+        groups_with_ranges = 0
+        groups_without_ranges = 0
         
         for i, group_id in enumerate(GROUP_B_IDS, 1):
             # Check if this Group B has an amount range configured
             if group_id in group_b_amount_ranges:
+                groups_with_ranges += 1
                 range_config = group_b_amount_ranges[group_id]
-                range_text = f" (Range: {range_config['min']}-{range_config['max']})"
-            else:
-                range_text = " (No range - accepts all amounts)"
+                min_amt = range_config['min']
+                max_amt = range_config['max']
                 
-            message += f"{i}. {group_id}{range_text}\n"
+                # Visual range indicator
+                if max_amt - min_amt <= 500:
+                    range_icon = "🎯"  # Narrow range
+                elif max_amt - min_amt <= 2000:
+                    range_icon = "🔵"  # Medium range
+                else:
+                    range_icon = "🟢"  # Wide range
+                    
+                message += f"{i}. {range_icon} Group B #{i}\n"
+                message += f"   📍 ID: `{group_id}`\n"
+                message += f"   💰 Range: **{min_amt} - {max_amt}**\n"
+                message += f"   📏 Span: {max_amt - min_amt} units\n\n"
+            else:
+                groups_without_ranges += 1
+                message += f"{i}. ⚪ Group B #{i}\n"
+                message += f"   📍 ID: `{group_id}`\n"
+                message += f"   💰 Range: **ALL** (20-5000)\n"
+                message += f"   ⚠️ No filter configured\n\n"
         
-        message += f"\n📊 Total: {len(GROUP_B_IDS)} Group B chat(s)\n\n"
-        message += "💡 Use /setgroupbrange to set amount ranges for specific Group B chats"
+        # Summary statistics
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "📈 **SUMMARY**\n"
+        message += f"• Total Groups: {len(GROUP_B_IDS)}\n"
+        message += f"• With Ranges: {groups_with_ranges} ✅\n"
+        message += f"• Without Ranges: {groups_without_ranges} ⚪\n\n"
         
-        update.message.reply_text(message)
+        # Legend
+        message += "**LEGEND:**\n"
+        message += "🎯 Narrow range (<500 units)\n"
+        message += "🔵 Medium range (500-2000 units)\n"
+        message += "🟢 Wide range (>2000 units)\n"
+        message += "⚪ No range filter (accepts all)\n\n"
+        
+        # Quick commands
+        message += "**QUICK COMMANDS:**\n"
+        message += "• Set range: `/setgroupbrange`\n"
+        message += "• Remove range: `/removegroupbrange`\n"
+        message += "• View ranges: `/listgroupbranges`"
+        
+        # Send with markdown parsing
+        update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error in handle_list_group_b_ids: {e}")
