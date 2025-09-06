@@ -5,9 +5,11 @@ import json
 import time
 import random
 import threading
-from typing import Dict, Optional, List, Any
+import io
+from typing import Dict, Optional, List, Any, Set, Tuple
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import pytz
 
 # Load environment variables from .env file if it exists (for local development)
 try:
@@ -27,6 +29,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Singapore timezone for all datetime operations
+SINGAPORE_TZ = pytz.timezone('Asia/Singapore')
 
 # Bot token from environment variable (required for Render)
 TOKEN = os.getenv("BOT_TOKEN")
@@ -79,6 +84,204 @@ ACCOUNTING_DATA_FILE = "accounting_data.json"
 AUTHORIZED_SUMMARY_GROUPS_FILE = "authorized_summary_groups.json"
 BILL_RESET_TIMES_FILE = "bill_reset_times.json"
 ARCHIVED_BILLS_FILE = "archived_bills.json"
+GROUP_NAMES_FILE = "group_names.json"
+
+# =============================
+# 业绩计算（按操作人汇总 TXT）
+# =============================
+
+# 会话状态：以 chat_id:user_id 为键，存储待汇总的文件与操作人
+PERFORMANCE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+def _perf_session_key(update: Update) -> str:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    user_id = update.effective_user.id if update.effective_user else 0
+    return f"{chat_id}:{user_id}"
+
+def _parse_operator_table_from_text(text: str) -> Dict[str, int]:
+    """从账单 TXT 文本中解析“按操作人统计”表，返回 {操作人: 入款(int)}。"""
+    lines = text.splitlines()
+    operator_sums: Dict[str, int] = {}
+
+    # 定位“按操作人统计”段落
+    start_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if "按操作人统计" in line:
+            start_idx = i
+            break
+    if start_idx is None:
+        return operator_sums
+
+    # 跳过标题与表头到数据行
+    i = start_idx + 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and ("名称" in lines[i] and "入款" in lines[i]):
+        i += 1
+
+    # 读取数据行，直到空行或下一节
+    while i < len(lines):
+        raw = lines[i].strip()
+        if not raw:
+            break
+        if ("按回复人统计" in raw) or ("按汇率统计" in raw) or ("总入款" in raw) or ("费率" in raw) or ("固定汇率" in raw):
+            break
+        parts = [p for p in re.split(r"\t+|\s{2,}", raw) if p]
+        if len(parts) >= 2:
+            name = parts[0].strip()
+            amt_str = re.sub(r"[^\d-]", "", parts[1])
+            try:
+                amount = int(amt_str) if amt_str not in ("", "-") else 0
+            except ValueError:
+                amount = 0
+            operator_sums[name] = operator_sums.get(name, 0) + amount
+        i += 1
+
+    return operator_sums
+
+def _download_text_from_file_id(context: CallbackContext, file_id: str) -> Tuple[str, str]:
+    """下载 Telegram 文档为文本，返回 (文本内容, 文件名)。若解码失败则返回空文本。"""
+    try:
+        tg_file = context.bot.get_file(file_id)
+        buffer = io.BytesIO()
+        tg_file.download(out=buffer)
+        data = buffer.getvalue()
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("gbk")
+            except Exception:
+                text = data.decode("utf-8", errors="ignore")
+        return text, os.path.basename(getattr(tg_file, "file_path", ""))
+    except Exception as e:
+        logger.error(f"下载文件失败: {e}")
+        return "", ""
+
+def handle_perf_start(update: Update, context: CallbackContext) -> None:
+    """开始业绩计算，会话初始化。支持：计算业绩 [操作人名]。"""
+    key = _perf_session_key(update)
+    text = update.message.text.strip()
+    m = re.match(r"^计算业绩\s*(.*)$", text)
+    operator_name = m.group(1).strip() if m and m.group(1) else None
+
+    PERFORMANCE_SESSIONS[key] = {
+        "operator_name": operator_name,
+        "files": [],
+    }
+
+    if operator_name:
+        update.message.reply_text(
+            f"已开始业绩计算，会以操作人“{operator_name}”为目标。\n"
+            "现在请将需要统计的账单TXT逐个转发/上传到此聊天，"
+            "然后对每个TXT消息回复任意数字(如1)，表示选择该文件；全部选择完后回复‘完成’。若要取消请输入‘重置’。"
+        )
+    else:
+        update.message.reply_text(
+            "已开始业绩计算。请先发送操作人姓名，或直接开始转发/上传账单TXT，"
+            "然后对每个TXT消息回复数字(如1)以选择；全部选择完后回复‘完成’。"
+        )
+
+def handle_perf_set_operator(update: Update, context: CallbackContext) -> None:
+    """设置/更新本会话的操作人姓名（当尚未设置时）。仅限私聊。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    if session.get("operator_name"):
+        return
+    name = update.message.text.strip()
+    if name in ("完成", "汇总", "计算", "重置"):
+        return
+    session["operator_name"] = name
+    update.message.reply_text(
+        f"操作人已设置为“{name}”。继续选择TXT文件，全部完成后回复‘完成’。"
+    )
+
+def handle_perf_add_by_reply(update: Update, context: CallbackContext) -> None:
+    """当用户回复一个TXT文档，并输入数字时，将该被回复的文档加入会话待统计列表。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    if not update.message.reply_to_message:
+        return
+    replied = update.message.reply_to_message
+    doc = replied.document
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        return
+    file_entry = {"file_id": doc.file_id, "file_name": doc.file_name or "账单.txt"}
+    existing = session.get("files", [])
+    if all(f["file_id"] != doc.file_id for f in existing):
+        existing.append(file_entry)
+        session["files"] = existing
+        update.message.reply_text(f"已加入：{file_entry['file_name']}。当前共 {len(existing)} 个文件。")
+
+def handle_perf_finish(update: Update, context: CallbackContext) -> None:
+    """完成并汇总，输出按操作人入款总额（或指定操作人）。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    operator_name = session.get("operator_name")
+    files = session.get("files", [])
+    if not files:
+        update.message.reply_text("尚未添加任何账单TXT，请先对TXT消息回复数字以选择，然后再发送‘完成’。")
+        return
+
+    total_by_operator: Dict[str, int] = {}
+    parsed_files = 0
+    for f in files:
+        content, _ = _download_text_from_file_id(context, f["file_id"])
+        if not content:
+            continue
+        ops = _parse_operator_table_from_text(content)
+        if not ops:
+            # 兜底：按明细行推断（第二列形如 160/8.3=19.28U，最后一列为操作人）
+            for line in content.splitlines():
+                cols = [p for p in re.split(r"\t+|\s{2,}", line.strip()) if p]
+                if len(cols) >= 4 and "/" in cols[1] and cols[-1]:
+                    name = cols[-1].strip()
+                    left = cols[1].split("/")[0]
+                    left = re.sub(r"[^\d-]", "", left)
+                    try:
+                        amount = int(left)
+                    except Exception:
+                        continue
+                    total_by_operator[name] = total_by_operator.get(name, 0) + amount
+            parsed_files += 1
+            continue
+        for name, amt in ops.items():
+            total_by_operator[name] = total_by_operator.get(name, 0) + amt
+        parsed_files += 1
+
+    if parsed_files == 0:
+        update.message.reply_text("未能解析任何文件，请确认为标准账单TXT。")
+        return
+
+    if operator_name and operator_name not in ("全部", "所有", "ALL", "all"):
+        total = total_by_operator.get(operator_name, 0)
+        update.message.reply_text(f"✅ 汇总完成：操作人“{operator_name}”入款总额：{total}")
+    else:
+        grand_total = sum(total_by_operator.values())
+        top_lines = []
+        for name, amt in sorted(total_by_operator.items(), key=lambda x: x[1], reverse=True)[:10]:
+            top_lines.append(f"{name}: {amt}")
+        body = "\n".join(top_lines) if top_lines else "(无)"
+        update.message.reply_text(
+            f"✅ 汇总完成：全部操作人入款总额：{grand_total}\n\n主要明细：\n{body}"
+        )
+
+    PERFORMANCE_SESSIONS.pop(key, None)
+
+def handle_perf_reset(update: Update, context: CallbackContext) -> None:
+    key = _perf_session_key(update)
+    if key in PERFORMANCE_SESSIONS:
+        PERFORMANCE_SESSIONS.pop(key, None)
+        update.message.reply_text("已重置当前业绩计算会话。")
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -105,8 +308,9 @@ group_a_reply_forwards: Dict[int, Dict] = {}  # Format: {group_b_msg_id: {group_
 authorized_accounting_groups: Set[int] = set()  # Groups authorized to use accounting bot
 accounting_data: Dict[int, Dict] = {}  # Format: {chat_id: {transactions: [], exchange_rate: 10.8, distributions: [], fee_rate: 0.0}}
 authorized_summary_groups: Set[int] = set()  # Groups that can use 财务查账
-bill_reset_times: Dict[int, str] = {}  # chat_id -> time in HH:MM format
+bill_reset_times: Dict[int, str] = {}  # chat_id -> time in HH:MM format (default: 00:00)
 archived_bills: Dict[int, Dict] = {}  # chat_id -> {date: bill_data}
+group_names: Dict[int, str] = {}  # chat_id -> group_name for display purposes
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -258,11 +462,19 @@ def save_config_data():
             logger.info(f"Saved archived bills to file")
     except Exception as e:
         logger.error(f"Error saving archived bills: {e}")
+    
+    # Save Group Names
+    try:
+        with open(GROUP_NAMES_FILE, 'w') as f:
+            json.dump(group_names, f, indent=2)
+            logger.info(f"Saved group names to file")
+    except Exception as e:
+        logger.error(f"Error saving group names: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges, group_a_reply_forwards, authorized_accounting_groups, accounting_data, authorized_summary_groups, bill_reset_times, archived_bills
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges, group_a_reply_forwards, authorized_accounting_groups, accounting_data, authorized_summary_groups, bill_reset_times, archived_bills, group_names
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -408,6 +620,19 @@ def load_config_data():
         except Exception as e:
             logger.error(f"Error loading archived bills: {e}")
             archived_bills = {}
+    
+    # Load Group Names
+    if os.path.exists(GROUP_NAMES_FILE):
+        try:
+            with open(GROUP_NAMES_FILE, 'r') as f:
+                group_names_json = json.load(f)
+                group_names = {int(chat_id): name for chat_id, name in group_names_json.items()}
+                logger.info(f"Loaded group names from file: {len(group_names)} groups")
+        except Exception as e:
+            logger.error(f"Error loading group names: {e}")
+            group_names = {}
+    else:
+        group_names = {}
 
 # Accounting bot functions
 def initialize_accounting_data(chat_id):
@@ -426,20 +651,21 @@ def initialize_accounting_data(chat_id):
         save_config_data()
         logger.info(f"Initialized accounting data for group {chat_id}")
 
-def add_transaction(chat_id, amount, user_info, transaction_type='deposit'):
+def add_transaction(chat_id, amount, user_info, transaction_type='deposit', operator=None):
     """Add a transaction to the accounting system."""
     if chat_id not in accounting_data:
         initialize_accounting_data(chat_id)
     
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%H:%M")
+    # Get current timestamp in Singapore time
+    timestamp = datetime.now(SINGAPORE_TZ).strftime("%H:%M")
     
     transaction = {
         'timestamp': timestamp,
         'amount': amount,
-        'user_info': user_info,
+        'user_info': user_info,  # Target user (who the transaction is for)
+        'operator': operator or user_info,  # Operator (who added the transaction)
         'type': transaction_type,  # 'deposit' or 'distribution'
-        'date': datetime.now().strftime("%Y-%m-%d")
+        'date': datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
     }
     
     if transaction_type == 'deposit':
@@ -456,7 +682,7 @@ def generate_bill(chat_id):
         return "❌ 此群组未初始化记账系统"
     
     data = accounting_data[chat_id]
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
     
     # Filter today's transactions
     today_deposits = [t for t in data['transactions'] if t['date'] == today and t['amount'] > 0]
@@ -525,7 +751,7 @@ def is_summary_group_authorized(chat_id):
 
 def cleanup_old_records():
     """Remove records older than 7 days from all accounting data."""
-    cutoff_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    cutoff_date = (datetime.now(SINGAPORE_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
     
     for chat_id in accounting_data:
         data = accounting_data[chat_id]
@@ -551,7 +777,7 @@ def archive_and_reset_bill(chat_id):
         return
     
     data = accounting_data[chat_id]
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(SINGAPORE_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
     
     # Generate and archive yesterday's bill
     archived_bill = {
@@ -582,7 +808,7 @@ def archive_and_reset_bill(chat_id):
 
 def get_bill_for_date(chat_id, date):
     """Get bill for a specific date."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
     
     if date == today:
         return generate_bill(chat_id)
@@ -646,7 +872,7 @@ def get_bill_for_date(chat_id, date):
 
 def generate_consolidated_summary(date):
     """Generate consolidated summary in the exact template format requested."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
     
     summary_content = f"财务总结 - {date}\n{'='*50}\n\n"
     
@@ -685,30 +911,33 @@ def generate_consolidated_summary(date):
         if group_net_total <= 0:
             continue  # Skip if no net deposits
         
-        # Collect user totals for this group
+        # Collect user totals for this group (use operator for summary)
         group_user_totals = {}
         for transaction in deposits:
-            user = transaction['user_info']
+            # Use operator for summary (who added the transaction)
+            user = transaction.get('operator', transaction['user_info'])
             if user not in group_user_totals:
                 group_user_totals[user] = 0
             group_user_totals[user] += transaction['amount']
         
         # Subtract withdrawals from users (if any)
         for transaction in withdrawals:
-            user = transaction['user_info']
+            # Use operator for summary (who added the transaction)
+            user = transaction.get('operator', transaction['user_info'])
             if user not in group_user_totals:
                 group_user_totals[user] = 0
             group_user_totals[user] -= abs(transaction['amount'])
         
         # Only keep users with positive amounts
-        group_user_totals = {user: amount for user, amount in group_user_totals.items() if amount > 0}
+        group_user_totals = {user: amount for user, amount in group_user_totals.items() if amount > 0 and user.strip()}
         
-        if not group_user_totals:
-            continue
+        # Get group name
+        group_name = group_names.get(group_id, f"群组 {abs(group_id) % 10000}")
         
         # Store group data
         group_data_list.append({
             'id': group_id,
+            'name': group_name,
             'total': group_net_total,
             'exchange_rate': exchange_rate,
             'users': group_user_totals
@@ -725,27 +954,26 @@ def generate_consolidated_summary(date):
     if not group_data_list:
         return f"财务总结 - {date}\n{'='*50}\n\n❌ 没有找到该日期的有效记录"
     
-    # Generate group sections (using template format)
-    for i, group_data in enumerate(group_data_list, 1):
-        group_id = group_data['id']
+    # Generate group sections (using Chinese format with group names)
+    for group_data in group_data_list:
+        group_name = group_data['name']
         group_total = group_data['total']
         exchange_rate = group_data['exchange_rate']
         users = group_data['users']
         
-        summary_content += f"group {i} : {group_total}/{exchange_rate} = {group_total/exchange_rate:.2f}\n"
+        summary_content += f"{group_name} : {group_total}/{exchange_rate} = {group_total/exchange_rate:.2f}\n"
         
-        # Add users for this group
+        # Add users for this group (only if they exist)
         for user, amount in sorted(users.items(), key=lambda x: x[1], reverse=True):
             summary_content += f"{user}: {amount}/{exchange_rate}= {amount/exchange_rate:.2f}\n"
         
         summary_content += "\n"
     
     # Generate summary of users (cross-group totals)
-    summary_content += "summary of user\n"
+    summary_content += "用户汇总\n"
     
     if all_user_totals:
-        # Use the first group's exchange rate for user summary (or calculate weighted average)
-        # For simplicity, using the first group's rate, but could be enhanced
+        # Use the first group's exchange rate for user summary
         summary_exchange_rate = group_data_list[0]['exchange_rate'] if group_data_list else 10.8
         
         for user, total in sorted(all_user_totals.items(), key=lambda x: x[1], reverse=True):
@@ -754,20 +982,21 @@ def generate_consolidated_summary(date):
     summary_content += "\n"
     
     # Generate summary of bill (group totals + overall total)
-    summary_content += "summary of bill\n"
+    summary_content += "账单汇总\n"
     
-    for i, group_data in enumerate(group_data_list, 1):
+    for group_data in group_data_list:
+        group_name = group_data['name']
         group_total = group_data['total']
         exchange_rate = group_data['exchange_rate']
-        summary_content += f"group {i}: {group_total}/{exchange_rate}={group_total/exchange_rate:.2f}\n"
+        summary_content += f"{group_name}: {group_total}/{exchange_rate}={group_total/exchange_rate:.2f}\n"
     
     # Calculate overall total using weighted average exchange rate
     if group_data_list:
         # Use weighted average exchange rate for final total
         total_value_in_usd = sum(group['total']/group['exchange_rate'] for group in group_data_list)
-        summary_content += f"total: {total_all_deposits}/avg={total_value_in_usd:.2f}\n"
+        summary_content += f"总计: {total_all_deposits}/平均汇率={total_value_in_usd:.2f}\n"
     
-    summary_content += f"\n生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    summary_content += f"\n生成时间: {datetime.now(SINGAPORE_TZ).strftime('%Y-%m-%d %H:%M:%S')} (新加坡时间)"
     
     return summary_content
 
@@ -800,7 +1029,7 @@ def is_global_admin(user_id):
     """Check if user is a global admin."""
     return user_id in GLOBAL_ADMINS
 
-def is_amount_within_group_b_range(group_b_id: int, amount: int) -> bool:
+def is_amount_within_group_b_range(group_b_id: int, amount: float) -> bool:
     """Check if the amount is within the allowed range for a specific Group B."""
     if group_b_id not in group_b_amount_ranges:
         # If no range is set for this Group B, allow all amounts (preserve original behavior)
@@ -1157,7 +1386,7 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
         return
     
     # Match any of the formats:
-    # - Just a number
+    # - Just a number (supports decimals like 100.50)
     # - number+群 or number 群
     # - 群+number or 群 number
     # - 微信+number or 微信 number 
@@ -1165,15 +1394,15 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # - 微信群+number or 微信群 number
     # - number+微信群 or number 微信群
     patterns = [
-        r'^(\d+)$',  # Just a number
-        r'^(\d+)\s*群$',  # number+群
-        r'^群\s*(\d+)$',  # 群+number
-        r'^微信\s*(\d+)$',  # 微信+number
-        r'^(\d+)\s*微信$',  # number+微信
-        r'^微信群\s*(\d+)$',  # 微信群+number
-        r'^(\d+)\s*微信群$',  # number+微信群
-        r'^微信\s*群\s*(\d+)$',  # 微信 群 number (with spaces)
-        r'^(\d+)\s*微信\s*群$'   # number 微信 群 (with spaces)
+        r'^(\d+(?:\.\d+)?)$',  # Just a number (supports decimals)
+        r'^(\d+(?:\.\d+)?)\s*群$',  # number+群 (supports decimals)
+        r'^群\s*(\d+(?:\.\d+)?)$',  # 群+number (supports decimals)
+        r'^微信\s*(\d+(?:\.\d+)?)$',  # 微信+number (supports decimals)
+        r'^(\d+(?:\.\d+)?)\s*微信$',  # number+微信 (supports decimals)
+        r'^微信群\s*(\d+(?:\.\d+)?)$',  # 微信群+number (supports decimals)
+        r'^(\d+(?:\.\d+)?)\s*微信群$',  # number+微信群 (supports decimals)
+        r'^微信\s*群\s*(\d+(?:\.\d+)?)$',  # 微信 群 number (supports decimals)
+        r'^(\d+(?:\.\d+)?)\s*微信\s*群$'   # number 微信 群 (supports decimals)
     ]
     
     amount = None
@@ -1190,8 +1419,8 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     
     # Check if the number is between 20 and 5000 (inclusive)
     try:
-        amount_int = int(amount)
-        if amount_int < 20 or amount_int > 5000:
+        amount_float = float(amount)
+        if amount_float < 20 or amount_float > 5000:
             logger.info(f"Number {amount} is outside the allowed range (20-5000).")
             return
     except ValueError:
@@ -1246,10 +1475,10 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     logger.info(f"Image metadata: {metadata}")
     
     # FIRST: Find all Group B chats that can handle this amount
-    valid_group_bs = get_group_b_for_amount(amount_int)
+    valid_group_bs = get_group_b_for_amount(amount_float)
     
     if not valid_group_bs:
-        logger.info(f"No Group B chats can handle amount {amount_int}. Remaining completely silent.")
+        logger.info(f"No Group B chats can handle amount {amount_float}. Remaining completely silent.")
         # Set image status back to open since we're not processing it
         db.set_image_status(image['image_id'], "open")
         return
@@ -1257,26 +1486,39 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     # Get the proper Group B ID for this image from the valid ones
     target_group_b_id = None
     
-    # If image already has a Group B mapping, check if it's in the valid list
+    # STRICT RANGE ENFORCEMENT: Only send if original Group B can handle the amount
     if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
         try:
             existing_group_b_id = int(metadata['source_group_b_id'])
-            if existing_group_b_id in valid_group_bs:
-                target_group_b_id = existing_group_b_id
-                logger.info(f"Using existing Group B mapping {target_group_b_id} (valid for amount {amount_int})")
+            # Check if the original Group B still exists AND can handle this amount
+            if existing_group_b_id in GROUP_B_IDS:
+                if existing_group_b_id in valid_group_bs:
+                    # Original group can handle the amount - use it
+                    target_group_b_id = existing_group_b_id
+                    logger.info(f"Using ORIGINAL Group B {target_group_b_id} (can handle amount {amount_float})")
+                else:
+                    # Original group CANNOT handle the amount - STAY SILENT
+                    logger.info(f"Original Group B {existing_group_b_id} CANNOT handle amount {amount_float} (outside range). STAYING SILENT.")
+                    logger.info(f"Image belongs to Group B {existing_group_b_id} but amount is not in their range. NOT forwarding.")
+                    db.set_image_status(image['image_id'], "open")
+                    return
             else:
-                logger.info(f"Existing Group B mapping {existing_group_b_id} cannot handle amount {amount_int}")
+                logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
+                # If original group doesn't exist, stay silent
+                logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
+                db.set_image_status(image['image_id'], "open")
+                return
         except (ValueError, TypeError) as e:
             logger.error(f"Error reading existing Group B mapping: {e}")
     
-    # If no valid existing mapping, select from valid Group B chats
+    # Only if image has NO ownership, select from valid Group B chats using ranges
     if target_group_b_id is None:
-        # Use deterministic selection from valid Group B chats
+        # Use deterministic selection from valid Group B chats for NEW images only
         image_hash = hash(image['image_id'])
         selected_index = abs(image_hash) % len(valid_group_bs)
         target_group_b_id = valid_group_bs[selected_index]
         
-        logger.info(f"Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
+        logger.info(f"NEW image with no ownership. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
         
         # Update image metadata with the new mapping
         updated_metadata = metadata.copy() if isinstance(metadata, dict) else {}
@@ -1445,7 +1687,7 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
             metadata = image.get('metadata', {}) if image else {}
             
             # Find valid Group B chats for this amount
-            valid_group_bs = get_group_b_for_amount(int(amount))
+            valid_group_bs = get_group_b_for_amount(float(amount))
             
             if not valid_group_bs:
                 logger.info(f"No Group B chats can handle amount {amount}. Remaining silent.")
@@ -1455,21 +1697,40 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 del pending_requests[request_msg_id]
                 return
             
-            # Select appropriate Group B from valid ones
+            # STRICT RANGE ENFORCEMENT: Only send if original Group B can handle the amount
             target_group_b_id = None
             if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
                 try:
                     existing_group_b_id = int(metadata['source_group_b_id'])
-                    if existing_group_b_id in valid_group_bs:
-                        target_group_b_id = existing_group_b_id
+                    # Check if the original Group B still exists AND can handle this amount
+                    if existing_group_b_id in GROUP_B_IDS:
+                        if existing_group_b_id in valid_group_bs:
+                            # Original group can handle the amount - use it
+                            target_group_b_id = existing_group_b_id
+                            logger.info(f"Using ORIGINAL Group B {target_group_b_id} (can handle amount {amount})")
+                        else:
+                            # Original group CANNOT handle the amount - STAY SILENT
+                            logger.info(f"Original Group B {existing_group_b_id} CANNOT handle amount {amount} (outside range). STAYING SILENT.")
+                            logger.info(f"Image belongs to Group B {existing_group_b_id} but amount is not in their range. NOT forwarding.")
+                            db.set_image_status(image['image_id'], "open")
+                            del pending_requests[request_msg_id]
+                            return
+                    else:
+                        logger.warning(f"Original Group B {existing_group_b_id} no longer exists in GROUP_B_IDS: {GROUP_B_IDS}")
+                        # If original group doesn't exist, stay silent
+                        logger.info(f"Image belongs to non-existent Group B {existing_group_b_id}. Staying silent.")
+                        db.set_image_status(image['image_id'], "open")
+                        del pending_requests[request_msg_id]
+                        return
                 except (ValueError, TypeError):
                     pass
             
             if target_group_b_id is None:
-                # Select from valid Group B chats
+                # Select from valid Group B chats using ranges for NEW images only
                 image_hash = hash(image['image_id'])
                 selected_index = abs(image_hash) % len(valid_group_bs)
                 target_group_b_id = valid_group_bs[selected_index]
+                logger.info(f"NEW image with no ownership. Selected Group B {target_group_b_id} from valid options: {valid_group_bs}")
             
             # First send the image to Group A
             # Get user mention who set the image
@@ -2246,7 +2507,12 @@ def button_callback(update: Update, context: CallbackContext) -> None:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             bill_content = generate_bill(chat_id)
-            filename = f"current_bill_{chat_id}_{today}.txt"
+            
+            # Use group name for filename
+            group_name = group_names.get(chat_id, f"群组{abs(chat_id) % 10000}")
+            # Clean up group name for filename (remove special characters)
+            clean_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            filename = f"{clean_name}_当前账单_{today}.txt"
             
             export_bill_as_file(context, query.message.chat_id, bill_content, filename)
             query.answer("当前账单已导出")
@@ -2269,8 +2535,8 @@ def button_callback(update: Update, context: CallbackContext) -> None:
             buttons = []
             
             for group_id in authorized_accounting_groups:
-                # Try to get group name (you may want to store group names separately)
-                group_name = f"群组 {group_id}"
+                # Get group name from stored names
+                group_name = group_names.get(group_id, f"群组 {abs(group_id) % 10000}")
                 buttons.append([InlineKeyboardButton(group_name, callback_data=f"audit_export_{selected_date}_{group_id}")])
             
             # Add summary button
@@ -2294,10 +2560,15 @@ def button_callback(update: Update, context: CallbackContext) -> None:
             
             try:
                 bill_content = get_bill_for_date(group_id, date)
-                filename = f"bill_{group_id}_{date}.txt"
+                
+                # Use group name for filename
+                group_name = group_names.get(group_id, f"群组{abs(group_id) % 10000}")
+                # Clean up group name for filename (remove special characters)
+                clean_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '-', '_')).strip()
+                filename = f"{clean_name}_{date}_账单.txt"
                 
                 export_bill_as_file(context, query.message.chat_id, bill_content, filename)
-                query.answer(f"群组 {group_id} 的 {date} 账单已导出")
+                query.answer(f"{group_name} 的 {date} 账单已导出")
                 
             except Exception as e:
                 logger.error(f"Error exporting group bill: {e}")
@@ -2311,7 +2582,7 @@ def button_callback(update: Update, context: CallbackContext) -> None:
             # Generate consolidated summary
             summary_content = generate_consolidated_summary(date)
             
-            filename = f"summary_{date}.txt"
+            filename = f"财务总结_{date}.txt"
             export_bill_as_file(context, query.message.chat_id, summary_content, filename)
             query.answer(f"{date} 财务总结已导出")
             
@@ -2804,7 +3075,9 @@ def handle_set_group_image(update: Update, context: CallbackContext) -> None:
     if GROUP_A_IDS:
         target_group_a_id = next(iter(GROUP_A_IDS))
     else:
-        target_group_a_id = GROUP_A_ID
+        # If no Group A is configured, we can't proceed
+        logger.error("No Group A configured for setting image")
+        return
     
     logger.info(f"Setting image target Group A ID: {target_group_a_id}")
     
@@ -3388,20 +3661,21 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
+    # Accounting amount handlers - support both formats: "+100" and "+100 @username"
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^\+\d+(\.\d+)?\s+.+'),
+        Filters.text & Filters.regex(r'^\+\d+(\.\d+)?(\s+.*)?$'),
         handle_accounting_add_amount,
         run_async=True
     ))
     
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^-\d+(\.\d+)?\s+.+'),
+        Filters.text & Filters.regex(r'^-\d+(\.\d+)?(\s+.*)?$'),
         handle_accounting_subtract_amount,
         run_async=True
     ))
     
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^下发\d+(\.\d+)?\s+.+'),
+        Filters.text & Filters.regex(r'^下发\d+(\.\d+)?(\s+.*)?$'),
         handle_accounting_distribute,
         run_async=True
     ))
@@ -3576,6 +3850,32 @@ def register_handlers(dispatcher):
     
     # Fix group type command
     dispatcher.add_handler(CommandHandler("fix_group_type", fix_group_type))
+
+    # ===== 业绩计算（私聊）=====
+    # 1) 开始会话：计算业绩 [操作人]
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^计算业绩(\s+.*)?$'),
+        handle_perf_start,
+        run_async=True
+    ))
+    # 2) 选择文件：对TXT文档消息回复数字(如1、1,2、1 2)
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.reply & Filters.regex(r'^\d+(?:[\s,，]*\d+)*$'),
+        handle_perf_add_by_reply,
+        run_async=True
+    ))
+    # 3) 完成汇总
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^(完成|汇总)$'),
+        handle_perf_finish,
+        run_async=True
+    ))
+    # 4) 重置会话
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^(重置|取消)$'),
+        handle_perf_reset,
+        run_async=True
+    ))
 
 def main() -> None:
     """Start the bot."""
@@ -4146,14 +4446,26 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def check_and_reset_bills():
     """Check if any bills need to be reset based on their scheduled times."""
-    current_time = datetime.now().strftime("%H:%M")
-    logger.info(f"Checking bill reset times at {current_time}")
+    # Use Singapore timezone
+    singapore_now = datetime.now(SINGAPORE_TZ)
+    current_time = singapore_now.strftime("%H:%M")
+    current_date = singapore_now.strftime("%Y-%m-%d")
     
-    for chat_id in list(bill_reset_times.keys()):
-        reset_time = bill_reset_times.get(chat_id, "00:00")
+    # Only log every 10 minutes to reduce spam, or when there are groups to check
+    if len(authorized_accounting_groups) > 0 and (current_time.endswith("0:00") or current_time.endswith("0:10") or current_time.endswith("0:20") or current_time.endswith("0:30") or current_time.endswith("0:40") or current_time.endswith("0:50")):
+        logger.info(f"Checking bill reset times at {current_time} (Singapore time) for {len(authorized_accounting_groups)} groups")
+    
+    # Check all authorized accounting groups
+    for chat_id in authorized_accounting_groups:
+        # Ensure bill reset time exists, set default if missing
+        if chat_id not in bill_reset_times:
+            bill_reset_times[chat_id] = "00:00"
+            logger.info(f"Set default bill reset time 00:00 for group {chat_id}")
+        
+        reset_time = bill_reset_times.get(chat_id, "00:00")  # Default to midnight
         
         if current_time == reset_time:
-            logger.info(f"Resetting bill for group {chat_id} at scheduled time {reset_time}")
+            logger.info(f"🔄 Resetting bill for group {chat_id} at scheduled time {reset_time} (Singapore time) on {current_date}")
             archive_and_reset_bill(chat_id)
 
 def daily_cleanup():
@@ -4171,12 +4483,12 @@ def start_scheduler():
                 # Check bill resets every minute
                 check_and_reset_bills()
                 
-                # Check for daily cleanup at 01:00
-                current_time = datetime.now()
+                # Check for daily cleanup at 01:00 Singapore time
+                current_time = datetime.now(SINGAPORE_TZ)
                 current_date = current_time.strftime("%Y-%m-%d")
                 current_hour_minute = current_time.strftime("%H:%M")
                 
-                # Run daily cleanup at 01:00 once per day
+                # Run daily cleanup at 01:00 Singapore time once per day
                 if current_hour_minute == "01:00" and last_cleanup_date != current_date:
                     daily_cleanup()
                     last_cleanup_date = current_date
@@ -4398,7 +4710,7 @@ def handle_remove_group_b_amount_range(update: Update, context: CallbackContext)
         update.message.reply_text("❌ Error removing Group B amount range")
 
 def handle_list_group_b_amount_ranges(update: Update, context: CallbackContext) -> None:
-    """List all Group B amount range settings - ONLY in private chat for global admins."""
+    """List all Group B amount range settings with visual coverage map - ONLY in private chat for global admins."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -4415,27 +4727,113 @@ def handle_list_group_b_amount_ranges(update: Update, context: CallbackContext) 
     try:
         if not group_b_amount_ranges:
             update.message.reply_text(
-                "📋 No Group B amount ranges are configured.\n\n"
-                "💡 All Group B chats will receive images for any amount (20-5000)\n\n"
-                "Use /setgroupbrange to set specific ranges for Group B chats."
+                "📋 **NO RANGES CONFIGURED**\n\n"
+                "All Group B chats currently accept ALL amounts (20-5000)\n\n"
+                "💡 Use `/setgroupbrange <group_id> <min> <max>` to configure ranges\n"
+                "💡 Use `/listgroupb` to see all Group B IDs",
+                parse_mode='Markdown'
             )
             return
         
-        message = "📋 Group B Amount Ranges:\n\n"
+        message = "🎯 **GROUP B RANGE COVERAGE MAP**\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        for group_id, range_config in group_b_amount_ranges.items():
-            min_amount = range_config.get("min", 20)
-            max_amount = range_config.get("max", 5000)
-            message += f"🎯 Group B {group_id}:\n"
-            message += f"   💰 Range: {min_amount} - {max_amount}\n\n"
+        # Sort ranges by minimum amount for better visualization
+        sorted_ranges = sorted(group_b_amount_ranges.items(), key=lambda x: x[1].get("min", 20))
         
-        message += "💡 Group B chats not listed will receive images for any amount (20-5000)\n\n"
-        message += "Commands:\n"
-        message += "• /setgroupbrange <id> <min> <max> - Set range\n"
-        message += "• /removegroupbrange <id> - Remove range\n"
-        message += "• /listgroupb - Show all Group B IDs"
+        # Create visual range map
+        message += "**AMOUNT SPECTRUM (20-5000)**\n"
+        message += "```\n"
         
-        update.message.reply_text(message)
+        # Check for gaps in coverage
+        covered_ranges = []
+        for group_id, range_config in sorted_ranges:
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            covered_ranges.append((min_amt, max_amt))
+        
+        # Find gaps
+        gaps = []
+        last_max = 19
+        for min_amt, max_amt in sorted(covered_ranges):
+            if min_amt > last_max + 1:
+                gaps.append((last_max + 1, min_amt - 1))
+            last_max = max(last_max, max_amt)
+        if last_max < 5000:
+            gaps.append((last_max + 1, 5000))
+        
+        message += "20 ──────────────────────── 5000\n"
+        
+        # Show each range as a bar
+        for i, (group_id, range_config) in enumerate(sorted_ranges, 1):
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            
+            # Calculate bar position (20 chars total)
+            start_pos = int(((min_amt - 20) / 4980) * 26)
+            end_pos = int(((max_amt - 20) / 4980) * 26)
+            bar_length = max(1, end_pos - start_pos)
+            
+            bar = " " * start_pos + "█" * bar_length
+            message += f"{bar[:26]}\n"
+        
+        message += "```\n\n"
+        
+        # Detailed range information
+        message += "**CONFIGURED RANGES:**\n\n"
+        for i, (group_id, range_config) in enumerate(sorted_ranges, 1):
+            min_amt = range_config.get("min", 20)
+            max_amt = range_config.get("max", 5000)
+            span = max_amt - min_amt
+            
+            # Determine overlap with other ranges
+            overlaps = []
+            for other_id, other_range in group_b_amount_ranges.items():
+                if other_id != group_id:
+                    other_min = other_range.get("min", 20)
+                    other_max = other_range.get("max", 5000)
+                    if not (max_amt < other_min or min_amt > other_max):
+                        overlaps.append(str(other_id)[-4:])
+            
+            message += f"**Range #{i}**\n"
+            message += f"📍 Group ID: `{group_id}`\n"
+            message += f"💰 Coverage: **{min_amt} - {max_amt}**\n"
+            message += f"📏 Span: {span} units\n"
+            
+            if overlaps:
+                message += f"⚠️ Overlaps with: {', '.join(overlaps)}\n"
+            
+            message += "\n"
+        
+        # Gap analysis
+        if gaps:
+            message += "⚠️ **UNCOVERED GAPS:**\n"
+            for gap_min, gap_max in gaps:
+                message += f"• {gap_min} - {gap_max} (no Group B will receive)\n"
+            message += "\n"
+        else:
+            message += "✅ **Full spectrum coverage!**\n\n"
+        
+        # Statistics
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "📊 **STATISTICS:**\n"
+        message += f"• Total ranges: {len(group_b_amount_ranges)}\n"
+        message += f"• Coverage gaps: {len(gaps)}\n"
+        
+        # Calculate total coverage
+        total_covered = 0
+        for min_amt, max_amt in covered_ranges:
+            total_covered += (max_amt - min_amt + 1)
+        coverage_percent = min(100, (total_covered / 4981) * 100)
+        message += f"• Coverage: {coverage_percent:.1f}% of spectrum\n\n"
+        
+        # Commands hint
+        message += "💡 **COMMANDS:**\n"
+        message += "• Add range: `/setgroupbrange`\n"
+        message += "• Remove: `/removegroupbrange`\n"
+        message += "• List groups: `/listgroupb`"
+        
+        update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error in handle_list_group_b_amount_ranges: {e}")
@@ -4459,16 +4857,27 @@ def handle_authorize_accounting(update: Update, context: CallbackContext) -> Non
     # Authorize the group
     authorized_accounting_groups.add(chat_id)
     initialize_accounting_data(chat_id)
+    
+    # Ensure bill reset time is set to default if not exists
+    if chat_id not in bill_reset_times:
+        bill_reset_times[chat_id] = "00:00"
+    
+    # Store group name for future reference
+    if update.effective_chat.title:
+        group_names[chat_id] = update.effective_chat.title
+    
     save_config_data()
     
     update.message.reply_text(
         "✅ 群组已授权使用记账机器人！\n\n"
         "📋 可用命令：\n"
-        "• +金额 用户信息 - 添加入款\n"
-        "• -金额 用户信息 - 添加出款\n"
-        "• 下发金额 用户信息 - 记录下发\n"
+        "• +金额 - 添加入款（回复消息时会记录用户）\n"
+        "• -金额 - 添加出款（回复消息时会记录用户）\n"
+        "• 下发金额 - 记录下发（回复消息时会记录用户）\n"
         "• 设置汇率 数值 - 设置汇率\n"
-        "• 账单 - 查看当前账单"
+        "• 账单 - 查看当前账单\n"
+        "• 设置账单时间 HH:MM - 设置每日重置时间\n"
+        "• 导出昨日账单 - 导出昨天的账单文件"
     )
     logger.info(f"Group {chat_id} authorized for accounting bot by admin {user_id}")
 
@@ -4487,28 +4896,49 @@ def handle_accounting_add_amount(update: Update, context: CallbackContext) -> No
         update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
         return
     
-    # Parse +amount user_info format
+    # Parse +amount format (no user info required)
     if not message_text.startswith('+'):
         return
     
     try:
-        # Remove + and split into amount and user info
+        # Remove + and get content
         content = message_text[1:].strip()
+        
+        # Parse amount and user info (support both formats)
         parts = content.split(' ', 1)
-        
-        if len(parts) < 2:
-            update.message.reply_text("❌ 格式错误。请使用：+金额 用户信息")
-            return
-        
         amount = float(parts[0])
-        user_info = parts[1]
         
-        # Add transaction
-        add_transaction(chat_id, amount, user_info, 'deposit')
+        # Get user info - priority: provided in message > reply > none
+        user_info = ""
+        if len(parts) > 1:
+            # User provided user info in message (+100 @username)
+            # Filter to only accept valid user info (starts with @ or is a name)
+            potential_user = parts[1].strip()
+            if potential_user.startswith('@') or (potential_user and not potential_user.replace('.', '').replace('-', '').isdigit()):
+                user_info = potential_user
         
-        # Generate and send updated bill
+        if not user_info and update.message.reply_to_message:
+            # Get user info from reply - prioritize name over username
+            replied_user = update.message.reply_to_message.from_user
+            user_info = replied_user.first_name or f"@{replied_user.username}" or "未知用户"
+        
+        # Store group name for future reference
+        if chat_id not in group_names and update.effective_chat.title:
+            group_names[chat_id] = update.effective_chat.title
+            save_config_data()
+        
+        # Add transaction - track operator (who added it) vs target user
+        operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        add_transaction(chat_id, amount, user_info, 'deposit', operator)
+        
+        # Generate and send updated bill with export button
         bill = generate_bill(chat_id)
-        update.message.reply_text(bill)
+        
+        # Add button to export current bill
+        keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(bill, reply_markup=reply_markup)
         
         logger.info(f"Added deposit: +{amount} for {user_info} in group {chat_id}")
         
@@ -4533,28 +4963,49 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
         update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
         return
     
-    # Parse -amount user_info format
+    # Parse -amount format (no user info required)
     if not message_text.startswith('-'):
         return
     
     try:
-        # Remove - and split into amount and user info
+        # Remove - and get content
         content = message_text[1:].strip()
+        
+        # Parse amount and user info (support both formats)
         parts = content.split(' ', 1)
-        
-        if len(parts) < 2:
-            update.message.reply_text("❌ 格式错误。请使用：-金额 用户信息")
-            return
-        
         amount = float(parts[0])
-        user_info = parts[1]
         
-        # Add negative transaction
-        add_transaction(chat_id, -amount, user_info, 'deposit')
+        # Get user info - priority: provided in message > reply > none
+        user_info = ""
+        if len(parts) > 1:
+            # User provided user info in message (-100 @username)
+            # Filter to only accept valid user info (starts with @ or is a name)
+            potential_user = parts[1].strip()
+            if potential_user.startswith('@') or (potential_user and not potential_user.replace('.', '').replace('-', '').isdigit()):
+                user_info = potential_user
         
-        # Generate and send updated bill
+        if not user_info and update.message.reply_to_message:
+            # Get user info from reply - prioritize name over username
+            replied_user = update.message.reply_to_message.from_user
+            user_info = replied_user.first_name or f"@{replied_user.username}" or "未知用户"
+        
+        # Store group name for future reference
+        if chat_id not in group_names and update.effective_chat.title:
+            group_names[chat_id] = update.effective_chat.title
+            save_config_data()
+        
+        # Add negative transaction - track operator (who added it) vs target user
+        operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        add_transaction(chat_id, -amount, user_info, 'deposit', operator)
+        
+        # Generate and send updated bill with export button
         bill = generate_bill(chat_id)
-        update.message.reply_text(bill)
+        
+        # Add button to export current bill
+        keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(bill, reply_markup=reply_markup)
         
         logger.info(f"Added withdrawal: -{amount} for {user_info} in group {chat_id}")
         
@@ -4579,28 +5030,49 @@ def handle_accounting_distribute(update: Update, context: CallbackContext) -> No
         update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
         return
     
-    # Parse 下发amount user_info format
+    # Parse 下发amount format (no user info required)
     if not message_text.startswith('下发'):
         return
     
     try:
-        # Remove 下发 and split into amount and user info
+        # Remove 下发 and get content
         content = message_text[2:].strip()
+        
+        # Parse amount and user info (support both formats)
         parts = content.split(' ', 1)
-        
-        if len(parts) < 2:
-            update.message.reply_text("❌ 格式错误。请使用：下发金额 用户信息")
-            return
-        
         amount = float(parts[0])
-        user_info = parts[1]
         
-        # Add distribution
-        add_transaction(chat_id, amount, user_info, 'distribution')
+        # Get user info - priority: provided in message > reply > none
+        user_info = ""
+        if len(parts) > 1:
+            # User provided user info in message (下发100 @username)
+            # Filter to only accept valid user info (starts with @ or is a name)
+            potential_user = parts[1].strip()
+            if potential_user.startswith('@') or (potential_user and not potential_user.replace('.', '').replace('-', '').isdigit()):
+                user_info = potential_user
         
-        # Generate and send updated bill
+        if not user_info and update.message.reply_to_message:
+            # Get user info from reply - prioritize name over username
+            replied_user = update.message.reply_to_message.from_user
+            user_info = replied_user.first_name or f"@{replied_user.username}" or "未知用户"
+        
+        # Store group name for future reference
+        if chat_id not in group_names and update.effective_chat.title:
+            group_names[chat_id] = update.effective_chat.title
+            save_config_data()
+        
+        # Add distribution - track operator (who added it) vs target user
+        operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        add_transaction(chat_id, amount, user_info, 'distribution', operator)
+        
+        # Generate and send updated bill with export button
         bill = generate_bill(chat_id)
-        update.message.reply_text(bill)
+        
+        # Add button to export current bill
+        keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(bill, reply_markup=reply_markup)
         
         logger.info(f"Added distribution: {amount} for {user_info} in group {chat_id}")
         
@@ -4762,15 +5234,18 @@ def handle_export_yesterday_bill(update: Update, context: CallbackContext) -> No
         return
     
     try:
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(SINGAPORE_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
         bill_content = get_bill_for_date(chat_id, yesterday)
         
         if bill_content.startswith("❌"):
             update.message.reply_text(bill_content)
             return
         
-        # Export as file
-        filename = f"bill_{chat_id}_{yesterday}.txt"
+        # Export as file using group name
+        group_name = group_names.get(chat_id, f"群组{abs(chat_id) % 10000}")
+        # Clean up group name for filename (remove special characters)
+        clean_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        filename = f"{clean_name}_昨日账单_{yesterday}.txt"
         export_bill_as_file(context, chat_id, bill_content, filename)
         
         logger.info(f"Yesterday's bill exported for group {chat_id}")
@@ -4824,10 +5299,10 @@ def handle_financial_audit(update: Update, context: CallbackContext) -> None:
         return
     
     try:
-        # Generate buttons for last 7 days
+        # Generate buttons for last 7 days (Singapore time)
         buttons = []
         for i in range(7):
-            date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            date = (datetime.now(SINGAPORE_TZ) - timedelta(days=i)).strftime("%Y-%m-%d")
             day_name = "今日" if i == 0 else f"{i}天前"
             buttons.append([InlineKeyboardButton(f"{date} ({day_name})", callback_data=f"audit_date_{date}")])
         
@@ -4843,7 +5318,7 @@ def handle_financial_audit(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("❌ 显示财务查账界面时发生错误。")
 
 def handle_list_group_b_ids(update: Update, context: CallbackContext) -> None:
-    """List all Group B IDs - ONLY in private chat for global admins."""
+    """List all Group B IDs with enhanced range visualization - ONLY in private chat for global admins."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -4862,22 +5337,62 @@ def handle_list_group_b_ids(update: Update, context: CallbackContext) -> None:
             update.message.reply_text("📋 No Group B chats are registered.")
             return
         
-        message = "📋 Registered Group B IDs:\n\n"
+        message = "📊 **GROUP B CONFIGURATION STATUS**\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # Count groups with and without ranges
+        groups_with_ranges = 0
+        groups_without_ranges = 0
         
         for i, group_id in enumerate(GROUP_B_IDS, 1):
             # Check if this Group B has an amount range configured
             if group_id in group_b_amount_ranges:
+                groups_with_ranges += 1
                 range_config = group_b_amount_ranges[group_id]
-                range_text = f" (Range: {range_config['min']}-{range_config['max']})"
-            else:
-                range_text = " (No range - accepts all amounts)"
+                min_amt = range_config['min']
+                max_amt = range_config['max']
                 
-            message += f"{i}. {group_id}{range_text}\n"
+                # Visual range indicator
+                if max_amt - min_amt <= 500:
+                    range_icon = "🎯"  # Narrow range
+                elif max_amt - min_amt <= 2000:
+                    range_icon = "🔵"  # Medium range
+                else:
+                    range_icon = "🟢"  # Wide range
+                    
+                message += f"{i}. {range_icon} Group B #{i}\n"
+                message += f"   📍 ID: `{group_id}`\n"
+                message += f"   💰 Range: **{min_amt} - {max_amt}**\n"
+                message += f"   📏 Span: {max_amt - min_amt} units\n\n"
+            else:
+                groups_without_ranges += 1
+                message += f"{i}. ⚪ Group B #{i}\n"
+                message += f"   📍 ID: `{group_id}`\n"
+                message += f"   💰 Range: **ALL** (20-5000)\n"
+                message += f"   ⚠️ No filter configured\n\n"
         
-        message += f"\n📊 Total: {len(GROUP_B_IDS)} Group B chat(s)\n\n"
-        message += "💡 Use /setgroupbrange to set amount ranges for specific Group B chats"
+        # Summary statistics
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "📈 **SUMMARY**\n"
+        message += f"• Total Groups: {len(GROUP_B_IDS)}\n"
+        message += f"• With Ranges: {groups_with_ranges} ✅\n"
+        message += f"• Without Ranges: {groups_without_ranges} ⚪\n\n"
         
-        update.message.reply_text(message)
+        # Legend
+        message += "**LEGEND:**\n"
+        message += "🎯 Narrow range (<500 units)\n"
+        message += "🔵 Medium range (500-2000 units)\n"
+        message += "🟢 Wide range (>2000 units)\n"
+        message += "⚪ No range filter (accepts all)\n\n"
+        
+        # Quick commands
+        message += "**QUICK COMMANDS:**\n"
+        message += "• Set range: `/setgroupbrange`\n"
+        message += "• Remove range: `/removegroupbrange`\n"
+        message += "• View ranges: `/listgroupbranges`"
+        
+        # Send with markdown parsing
+        update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error in handle_list_group_b_ids: {e}")
