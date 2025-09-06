@@ -5,7 +5,8 @@ import json
 import time
 import random
 import threading
-from typing import Dict, Optional, List, Any, Set
+import io
+from typing import Dict, Optional, List, Any, Set, Tuple
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
@@ -57,7 +58,7 @@ GROUP_B_IDS = set()  # Set of Group B chat IDs
 #     GROUP_B_IDS.add(GROUP_B_ID)
 
 # Admin system
-GLOBAL_ADMINS = set([5962096701, 1844353808, 7997704196, 5965182828, 19295597])  # Global admins with full permissions
+GLOBAL_ADMINS = set([5962096701, 1844353808, 7997704196, 5965182828])  # Global admins with full permissions
 GROUP_ADMINS = {}  # Format: {chat_id: set(user_ids)} - Group-specific admins
 
 # Message forwarding control
@@ -84,6 +85,235 @@ AUTHORIZED_SUMMARY_GROUPS_FILE = "authorized_summary_groups.json"
 BILL_RESET_TIMES_FILE = "bill_reset_times.json"
 ARCHIVED_BILLS_FILE = "archived_bills.json"
 GROUP_NAMES_FILE = "group_names.json"
+
+# =============================
+# 业绩计算（按操作人汇总 TXT）
+# =============================
+
+# 会话状态：以 chat_id:user_id 为键，存储待汇总的文件与操作人
+PERFORMANCE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+def _perf_session_key(update: Update) -> str:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    user_id = update.effective_user.id if update.effective_user else 0
+    return f"{chat_id}:{user_id}"
+
+def _parse_operator_table_from_text(text: str) -> Dict[str, int]:
+    """从账单 TXT 文本中解析“按操作人统计”表，返回 {操作人: 入款(int)}。"""
+    lines = text.splitlines()
+    operator_sums: Dict[str, int] = {}
+
+    # 定位“按操作人统计”段落
+    start_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if "按操作人统计" in line:
+            start_idx = i
+            break
+    if start_idx is None:
+        return operator_sums
+
+    # 跳过标题与表头到数据行
+    i = start_idx + 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and ("名称" in lines[i] and "入款" in lines[i]):
+        i += 1
+
+    # 读取数据行，直到空行或下一节
+    while i < len(lines):
+        raw = lines[i].strip()
+        if not raw:
+            break
+        if ("按回复人统计" in raw) or ("按汇率统计" in raw) or ("总入款" in raw) or ("费率" in raw) or ("固定汇率" in raw):
+            break
+        parts = [p for p in re.split(r"\t+|\s{2,}", raw) if p]
+        if len(parts) >= 2:
+            name = parts[0].strip()
+            amt_str = re.sub(r"[^\d-]", "", parts[1])
+            try:
+                amount = int(amt_str) if amt_str not in ("", "-") else 0
+            except ValueError:
+                amount = 0
+            operator_sums[name] = operator_sums.get(name, 0) + amount
+        i += 1
+
+    return operator_sums
+
+def _download_text_from_file_id(context: CallbackContext, file_id: str) -> Tuple[str, str]:
+    """下载 Telegram 文档为文本，返回 (文本内容, 文件名)。若解码失败则返回空文本。"""
+    try:
+        tg_file = context.bot.get_file(file_id)
+        buffer = io.BytesIO()
+        tg_file.download(out=buffer)
+        data = buffer.getvalue()
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("gbk")
+            except Exception:
+                text = data.decode("utf-8", errors="ignore")
+        return text, os.path.basename(getattr(tg_file, "file_path", ""))
+    except Exception as e:
+        logger.error(f"下载文件失败: {e}")
+        return "", ""
+
+def handle_perf_start(update: Update, context: CallbackContext) -> None:
+    """开始业绩计算，会话初始化。支持：
+    - 文本：计算业绩 [操作人名]
+    - 命令：/yeji [操作人名] 或 /perf [操作人名]
+    """
+    key = _perf_session_key(update)
+    text = update.message.text.strip()
+    operator_name = None
+    # 1) 命令形式：/yeji xxx 或 /perf xxx
+    if text.startswith('/'):
+        args = context.args or []
+        operator_name = " ".join(args).strip() if args else None
+    else:
+        # 2) 纯文本触发：计算业绩 [操作人名]
+        m = re.match(r"^计算业绩\s*(.*)$", text)
+        operator_name = m.group(1).strip() if m and m.group(1) else None
+
+    PERFORMANCE_SESSIONS[key] = {
+        "operator_name": operator_name,
+        "files": [],
+    }
+
+    if operator_name:
+        update.message.reply_text(
+            f"已开始业绩计算，会以操作人“{operator_name}”为目标。\n"
+            "现在请将需要统计的账单TXT逐个转发/上传到此聊天，"
+            "然后对每个TXT消息回复任意数字(如1)或命令 /add 表示选择；全部选择完后发送‘完成’或 /finish。若要取消请输入‘重置’或 /reset。"
+        )
+    else:
+        update.message.reply_text(
+            "已开始业绩计算。请先发送操作人姓名，或直接开始转发/上传账单TXT，"
+            "然后对每个TXT消息回复数字(如1)或命令 /add 以选择；全部选择完后发送‘完成’或 /finish。"
+        )
+
+def handle_perf_set_operator(update: Update, context: CallbackContext) -> None:
+    """设置/更新本会话的操作人姓名（当尚未设置时）。仅限私聊。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    if session.get("operator_name"):
+        return
+    name = update.message.text.strip()
+    if name in ("完成", "汇总", "计算", "重置"):
+        return
+    session["operator_name"] = name
+    update.message.reply_text(
+        f"操作人已设置为“{name}”。继续选择TXT文件，全部完成后回复‘完成’。"
+    )
+
+def handle_perf_add_by_reply(update: Update, context: CallbackContext) -> None:
+    """当用户回复一个TXT文档，并输入数字时，将该被回复的文档加入会话待统计列表。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    if not update.message.reply_to_message:
+        return
+    replied = update.message.reply_to_message
+    doc = replied.document
+    if not doc:
+        return
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        return
+    file_entry = {"file_id": doc.file_id, "file_name": doc.file_name or "账单.txt"}
+    existing = session.get("files", [])
+    if all(f["file_id"] != doc.file_id for f in existing):
+        existing.append(file_entry)
+        session["files"] = existing
+        update.message.reply_text(f"已加入：{file_entry['file_name']}。当前共 {len(existing)} 个文件。")
+
+def handle_perf_add_by_command(update: Update, context: CallbackContext) -> None:
+    """命令方式添加：在回复TXT文档的同时发送 /add。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        update.message.reply_text("请先发送 ‘计算业绩’ 或 /yeji 开始会话。")
+        return
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        update.message.reply_text("请先回复一个TXT文档消息再发送 /add。")
+        return
+    doc = update.message.reply_to_message.document
+    fname = (doc.file_name or "").lower()
+    if not fname.endswith(".txt"):
+        update.message.reply_text("仅支持TXT文档。")
+        return
+    file_entry = {"file_id": doc.file_id, "file_name": doc.file_name or "账单.txt"}
+    existing = session.get("files", [])
+    if all(f["file_id"] != doc.file_id for f in existing):
+        existing.append(file_entry)
+        session["files"] = existing
+    update.message.reply_text(f"已加入：{file_entry['file_name']}。当前共 {len(existing)} 个文件。")
+
+def handle_perf_finish(update: Update, context: CallbackContext) -> None:
+    """完成并汇总，输出按操作人入款总额（或指定操作人）。"""
+    key = _perf_session_key(update)
+    session = PERFORMANCE_SESSIONS.get(key)
+    if not session:
+        return
+    operator_name = session.get("operator_name")
+    files = session.get("files", [])
+    if not files:
+        update.message.reply_text("尚未添加任何账单TXT，请先对TXT消息回复数字以选择，然后再发送‘完成’。")
+        return
+
+    total_by_operator: Dict[str, int] = {}
+    parsed_files = 0
+    for f in files:
+        content, _ = _download_text_from_file_id(context, f["file_id"])
+        if not content:
+            continue
+        ops = _parse_operator_table_from_text(content)
+        if not ops:
+            # 兜底：按明细行推断（第二列形如 160/8.3=19.28U，最后一列为操作人）
+            for line in content.splitlines():
+                cols = [p for p in re.split(r"\t+|\s{2,}", line.strip()) if p]
+                if len(cols) >= 4 and "/" in cols[1] and cols[-1]:
+                    name = cols[-1].strip()
+                    left = cols[1].split("/")[0]
+                    left = re.sub(r"[^\d-]", "", left)
+                    try:
+                        amount = int(left)
+                    except Exception:
+                        continue
+                    total_by_operator[name] = total_by_operator.get(name, 0) + amount
+            parsed_files += 1
+            continue
+        for name, amt in ops.items():
+            total_by_operator[name] = total_by_operator.get(name, 0) + amt
+        parsed_files += 1
+
+    if parsed_files == 0:
+        update.message.reply_text("未能解析任何文件，请确认为标准账单TXT。")
+        return
+
+    if operator_name and operator_name not in ("全部", "所有", "ALL", "all"):
+        total = total_by_operator.get(operator_name, 0)
+        update.message.reply_text(f"✅ 汇总完成：操作人“{operator_name}”入款总额：{total}")
+    else:
+        grand_total = sum(total_by_operator.values())
+        top_lines = []
+        for name, amt in sorted(total_by_operator.items(), key=lambda x: x[1], reverse=True)[:10]:
+            top_lines.append(f"{name}: {amt}")
+        body = "\n".join(top_lines) if top_lines else "(无)"
+        update.message.reply_text(
+            f"✅ 汇总完成：全部操作人入款总额：{grand_total}\n\n主要明细：\n{body}"
+        )
+
+    PERFORMANCE_SESSIONS.pop(key, None)
+
+def handle_perf_reset(update: Update, context: CallbackContext) -> None:
+    key = _perf_session_key(update)
+    if key in PERFORMANCE_SESSIONS:
+        PERFORMANCE_SESSIONS.pop(key, None)
+        update.message.reply_text("已重置当前业绩计算会话。")
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -3652,6 +3882,32 @@ def register_handlers(dispatcher):
     
     # Fix group type command
     dispatcher.add_handler(CommandHandler("fix_group_type", fix_group_type))
+
+    # ===== 业绩计算（私聊）=====
+    # 1) 开始会话：计算业绩 [操作人]
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^计算业绩(\s+.*)?$'),
+        handle_perf_start,
+        run_async=True
+    ))
+    # 2) 选择文件：对TXT文档消息回复数字(如1、1,2、1 2)
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.reply & Filters.regex(r'^\d+(?:[\s,，]*\d+)*$'),
+        handle_perf_add_by_reply,
+        run_async=True
+    ))
+    # 3) 完成汇总
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^(完成|汇总)$'),
+        handle_perf_finish,
+        run_async=True
+    ))
+    # 4) 重置会话
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^(重置|取消)$'),
+        handle_perf_reset,
+        run_async=True
+    ))
 
 def main() -> None:
     """Start the bot."""
