@@ -3854,28 +3854,28 @@ def register_handlers(dispatcher):
     # ===== 业绩计算（私聊）=====
     # 1) 开始会话：计算业绩 [操作人]
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^计算业绩(\s+.*)?$'),
+        Filters.text & Filters.regex(r'计算业绩'),
         handle_perf_start,
         run_async=True
-    ))
+    ), group=-1)
     # 2) 选择文件：对TXT文档消息回复数字(如1、1,2、1 2)
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.reply & Filters.regex(r'^\d+(?:[\s,，]*\d+)*$'),
         handle_perf_add_by_reply,
         run_async=True
-    ))
+    ), group=-1)
     # 3) 完成汇总
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^(完成|汇总)$'),
+        Filters.text & Filters.regex(r'(完成|汇总)'),
         handle_perf_finish,
         run_async=True
-    ))
+    ), group=-1)
     # 4) 重置会话
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^(重置|取消)$'),
+        Filters.text & Filters.regex(r'(重置|取消)'),
         handle_perf_reset,
         run_async=True
-    ))
+    ), group=-1)
 
 def main() -> None:
     """Start the bot."""
