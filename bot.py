@@ -4096,7 +4096,27 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # 6. Group B message handling - single handler for everything
+    # 6. Performance and Finance commands (HIGH PRIORITY - before Group B catch-all)
+    # Personal performance command: 显示业绩
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'.*显示业绩.*'),
+        handle_personal_performance,
+        run_async=True
+    ), group=0)
+    
+    # Finance summary commands: 财务计算业绩 / 财务计算昨日业绩
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'.*财务计算业绩.*'),
+        handle_finance_today_summary,
+        run_async=True
+    ), group=0)
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'.*财务计算昨日业绩.*'),
+        handle_finance_yesterday_summary,
+        run_async=True
+    ), group=0)
+    
+    # 7. Group B message handling - single handler for everything (LOWER PRIORITY)
     # Updated to support multiple Group B chats
     if GROUP_B_IDS:
         dispatcher.add_handler(MessageHandler(
@@ -4105,7 +4125,7 @@ def register_handlers(dispatcher):
             run_async=True
         ), group=1)
     
-    # 7. Group A message handling
+    # 8. Group A message handling
     # First admin replies with '群'
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.reply & Filters.regex(r'^群$'),
@@ -4156,24 +4176,6 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # Personal performance command (Group B): 显示业绩
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'.*显示业绩.*'),
-        handle_personal_performance,
-        run_async=True
-    ), group=0)
-    
-    # Finance summary commands (any admin in authorized summary group): 财务计算业绩 / 财务计算昨日业绩
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'.*财务计算业绩.*'),
-        handle_finance_today_summary,
-        run_async=True
-    ), group=0)
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'.*财务计算昨日业绩.*'),
-        handle_finance_yesterday_summary,
-        run_async=True
-    ), group=0)
     
     # Add commands for forwarding control in private chat
     dispatcher.add_handler(CommandHandler("forwarding_on", handle_toggle_forwarding, Filters.chat_type.private))
