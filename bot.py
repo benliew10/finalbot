@@ -30,8 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Singapore timezone for all datetime operations
-SINGAPORE_TZ = pytz.timezone('Asia/Singapore')
+# Beijing timezone (UTC+8) for all datetime operations
+SINGAPORE_TZ = pytz.timezone('Asia/Shanghai')
 
 # Bot token from environment variable (required for Render)
 TOKEN = os.getenv("BOT_TOKEN")
@@ -85,6 +85,8 @@ AUTHORIZED_SUMMARY_GROUPS_FILE = "authorized_summary_groups.json"
 BILL_RESET_TIMES_FILE = "bill_reset_times.json"
 ARCHIVED_BILLS_FILE = "archived_bills.json"
 GROUP_NAMES_FILE = "group_names.json"
+GROUP_C_IDS_FILE = "group_c_ids.json"
+ACCOUNTING_NOTIFY_FILE = "accounting_notify.json"
 
 # =============================
 # 业绩计算（按操作人汇总 TXT）
@@ -343,6 +345,8 @@ authorized_summary_groups: Set[int] = set()  # Groups that can use 财务查账
 bill_reset_times: Dict[int, str] = {}  # chat_id -> time in HH:MM format (default: 00:00)
 archived_bills: Dict[int, Dict] = {}  # chat_id -> {date: bill_data}
 group_names: Dict[int, str] = {}  # chat_id -> group_name for display purposes
+GROUP_C_IDS = set()  # Set of Group C chat IDs (车队)
+ACCOUNTING_NOTIFY: Dict[int, bool] = {}  # chat_id -> whether to send immediate bill messages
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -502,11 +506,27 @@ def save_config_data():
             logger.info(f"Saved group names to file")
     except Exception as e:
         logger.error(f"Error saving group names: {e}")
+    
+    # Save Group C IDs
+    try:
+        with open(GROUP_C_IDS_FILE, 'w') as f:
+            json.dump(list(GROUP_C_IDS), f, indent=2)
+            logger.info(f"Saved {len(GROUP_C_IDS)} Group C IDs to file")
+    except Exception as e:
+        logger.error(f"Error saving Group C IDs: {e}")
+    
+    # Save accounting notify toggles
+    try:
+        with open(ACCOUNTING_NOTIFY_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in ACCOUNTING_NOTIFY.items()}, f, indent=2)
+            logger.info(f"Saved accounting notify settings for {len(ACCOUNTING_NOTIFY)} groups")
+    except Exception as e:
+        logger.error(f"Error saving accounting notify settings: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges, group_a_reply_forwards, authorized_accounting_groups, accounting_data, authorized_summary_groups, bill_reset_times, archived_bills, group_names
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges, group_a_reply_forwards, authorized_accounting_groups, accounting_data, authorized_summary_groups, bill_reset_times, archived_bills, group_names, ACCOUNTING_NOTIFY
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -666,6 +686,29 @@ def load_config_data():
     else:
         group_names = {}
 
+    # Load Group C IDs
+    if os.path.exists(GROUP_C_IDS_FILE):
+        try:
+            with open(GROUP_C_IDS_FILE, 'r') as f:
+                GROUP_C_IDS_LIST = json.load(f)
+                # Convert to int set
+                globals()['GROUP_C_IDS'] = set(int(x) for x in GROUP_C_IDS_LIST)
+                logger.info(f"Loaded {len(GROUP_C_IDS)} Group C IDs from file")
+        except Exception as e:
+            logger.error(f"Error loading Group C IDs: {e}")
+            globals()['GROUP_C_IDS'] = set()
+    
+    # Load accounting notify toggles
+    if os.path.exists(ACCOUNTING_NOTIFY_FILE):
+        try:
+            with open(ACCOUNTING_NOTIFY_FILE, 'r') as f:
+                data = json.load(f)
+                ACCOUNTING_NOTIFY = {int(k): bool(v) for k, v in data.items()}
+                logger.info(f"Loaded accounting notify settings for {len(ACCOUNTING_NOTIFY)} groups")
+        except Exception as e:
+            logger.error(f"Error loading accounting notify settings: {e}")
+            ACCOUNTING_NOTIFY = {}
+
 # Accounting bot functions
 def initialize_accounting_data(chat_id):
     """Initialize accounting data for a group."""
@@ -697,7 +740,8 @@ def add_transaction(chat_id, amount, user_info, transaction_type='deposit', oper
         'user_info': user_info,  # Target user (who the transaction is for)
         'operator': operator or user_info,  # Operator (who added the transaction)
         'type': transaction_type,  # 'deposit' or 'distribution'
-        'date': datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
+        'date': datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d"),
+        'source_group_type': 'C' if is_group_c(chat_id) else ('A' if int(chat_id) in GROUP_A_IDS else 'B')
     }
     
     if transaction_type == 'deposit':
@@ -751,10 +795,23 @@ def generate_bill(chat_id):
                 user_totals[user] = 0
             user_totals[user] += transaction['amount']
     
+    # Add operator totals for performance visibility (sum of deposits added by operator)
+    operator_totals = {}
+    for transaction in data['transactions']:
+        if transaction['amount'] > 0:
+            operator = transaction.get('operator') or ''
+            if operator:
+                operator_totals[operator] = operator_totals.get(operator, 0) + transaction['amount']
+    
     # Add user totals section
     bill += "\n"
     for user, total in sorted(user_totals.items(), key=lambda x: x[1], reverse=True):
         bill += f"{user} 总入 {total}\n"
+    
+    if operator_totals:
+        bill += "\n操作人汇总:\n"
+        for op, total in sorted(operator_totals.items(), key=lambda x: x[1], reverse=True):
+            bill += f"{op} 入款合计 {total}\n"
     
     # Calculate overall totals
     total_deposits = sum(t['amount'] for t in data['transactions'] if t['amount'] > 0)
@@ -780,6 +837,10 @@ def is_accounting_authorized(chat_id):
 def is_summary_group_authorized(chat_id):
     """Check if a group is authorized to use summary functions."""
     return chat_id in authorized_summary_groups
+
+def is_group_c(chat_id: int) -> bool:
+    """Check if a chat is Group C (车队)."""
+    return int(chat_id) in globals().get('GROUP_C_IDS', set())
 
 def cleanup_old_records():
     """Remove records older than 7 days from all accounting data."""
@@ -909,7 +970,9 @@ def generate_consolidated_summary(date):
     summary_content = f"财务总结 - {date}\n{'='*50}\n\n"
     
     # Data collection
-    all_user_totals = {}  # Combined across all groups
+    all_user_totals = {}  # Combined across all groups (by operator)
+    all_user_totals_company = {}  # Group A only
+    all_user_totals_fleet = {}    # Group C only
     group_data_list = []
     total_all_deposits = 0
     
@@ -982,6 +1045,11 @@ def generate_consolidated_summary(date):
             if user not in all_user_totals:
                 all_user_totals[user] = 0
             all_user_totals[user] += amount
+            # Split by group type for 财务计算业绩
+            if int(group_id) in GROUP_A_IDS:
+                all_user_totals_company[user] = all_user_totals_company.get(user, 0) + amount
+            if int(group_id) in GROUP_C_IDS:
+                all_user_totals_fleet[user] = all_user_totals_fleet.get(user, 0) + amount
     
     if not group_data_list:
         return f"财务总结 - {date}\n{'='*50}\n\n❌ 没有找到该日期的有效记录"
@@ -1010,6 +1078,15 @@ def generate_consolidated_summary(date):
         
         for user, total in sorted(all_user_totals.items(), key=lambda x: x[1], reverse=True):
             summary_content += f"{user}: {total}/{summary_exchange_rate}= {total/summary_exchange_rate:.2f}\n"
+
+    # Company vs Fleet breakdown
+    if all_user_totals_company or all_user_totals_fleet:
+        summary_content += "\n公司(群A) 用户汇总\n"
+        for user, total in sorted(all_user_totals_company.items(), key=lambda x: x[1], reverse=True):
+            summary_content += f"{user}: {total}\n"
+        summary_content += "\n车队(群C) 用户汇总\n"
+        for user, total in sorted(all_user_totals_fleet.items(), key=lambda x: x[1], reverse=True):
+            summary_content += f"{user}: {total}\n"
     
     summary_content += "\n"
     
@@ -1027,6 +1104,12 @@ def generate_consolidated_summary(date):
         # Use weighted average exchange rate for final total
         total_value_in_usd = sum(group['total']/group['exchange_rate'] for group in group_data_list)
         summary_content += f"总计: {total_all_deposits}/平均汇率={total_value_in_usd:.2f}\n"
+        
+        # 公司 vs 车队 总计
+        company_total = sum(group['total'] for group in group_data_list if int(group['id']) in GROUP_A_IDS)
+        fleet_total = sum(group['total'] for group in group_data_list if int(group['id']) in GROUP_C_IDS)
+        summary_content += f"公司(群A)总计: {company_total}\n"
+        summary_content += f"车队(群C)总计: {fleet_total}\n"
     
     summary_content += f"\n生成时间: {datetime.now(SINGAPORE_TZ).strftime('%Y-%m-%d %H:%M:%S')} (新加坡时间)"
     
@@ -1317,6 +1400,129 @@ def list_images(update: Update, context: CallbackContext) -> None:
     message += "\n\n🔄 To update Group B association:\n/setimagegroup <image_id> <group_b_id>"
     
     update.message.reply_text(message)
+
+def _toggle_accounting_notify(update: Update, context: CallbackContext, enable: bool) -> None:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    # Restrict to admins
+    if not (is_global_admin(user_id) or is_group_admin(user_id, chat_id)):
+        update.message.reply_text("只有管理员可以切换记账提示。")
+        return
+    ACCOUNTING_NOTIFY[int(chat_id)] = bool(enable)
+    save_config_data()
+    update.message.reply_text("✅ 已开启记账提示" if enable else "✅ 已关闭记账提示")
+
+def _sum_operator_across_groups(date: str) -> Dict[str, int]:
+    """Aggregate operator deposits across all accounting groups and Group C for a given date."""
+    totals: Dict[str, int] = {}
+    # Today or archived per group
+    for group_id in set(list(authorized_accounting_groups) + list(GROUP_C_IDS)):
+        if group_id not in accounting_data and date == datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d"):
+            continue
+        # Collect from in-memory (today)
+        if date == datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d") and group_id in accounting_data:
+            for t in accounting_data[group_id]['transactions']:
+                if t['date'] == date and t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if op:
+                        totals[op] = totals.get(op, 0) + t['amount']
+        # Include archived for yesterday-only usage
+        if date != datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d") and group_id in archived_bills and date in archived_bills[group_id]:
+            data = archived_bills[group_id][date]
+            for t in data['transactions']:
+                if t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if op:
+                        totals[op] = totals.get(op, 0) + t['amount']
+    return totals
+
+def handle_personal_performance(update: Update, context: CallbackContext) -> None:
+    """显示业绩: user in Group B sees their own operator total across Group A + Group C for today."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    # Only react in Group B chats (as requested)
+    # If needed, allow in any chat: remove this guard
+    # if int(chat_id) not in GROUP_B_IDS:
+    #     return
+    today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
+    op_key = f"@{user.username}" if user.username else (user.first_name or "")
+    if not op_key:
+        update.message.reply_text("无法识别操作者身份。请设置用户名或名字。")
+        return
+    totals = _sum_operator_across_groups(today)
+    amount = totals.get(op_key, 0)
+    update.message.reply_text(f"你的今日业绩：{amount}")
+
+def _finance_summary_for_date(date: str) -> str:
+    totals_company: Dict[str, int] = {}
+    totals_fleet: Dict[str, int] = {}
+    # Walk today/archived per group
+    for group_id in set(list(authorized_accounting_groups) + list(GROUP_C_IDS)):
+        # Today data
+        if date == datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d") and group_id in accounting_data:
+            for t in accounting_data[group_id]['transactions']:
+                if t['date'] == date and t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if not op:
+                        continue
+                    if int(group_id) in GROUP_C_IDS:
+                        totals_fleet[op] = totals_fleet.get(op, 0) + t['amount']
+                    elif int(group_id) in GROUP_A_IDS:
+                        totals_company[op] = totals_company.get(op, 0) + t['amount']
+        # Archived (yesterday)
+        if date != datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d") and group_id in archived_bills and date in archived_bills[group_id]:
+            data = archived_bills[group_id][date]
+            for t in data['transactions']:
+                if t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if not op:
+                        continue
+                    if int(group_id) in GROUP_C_IDS:
+                        totals_fleet[op] = totals_fleet.get(op, 0) + t['amount']
+                    elif int(group_id) in GROUP_A_IDS:
+                        totals_company[op] = totals_company.get(op, 0) + t['amount']
+    # Render
+    lines = ["财务计算业绩"]
+    if totals_company:
+        lines.append("\n公司(群A):")
+        for op, amt in sorted(totals_company.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"{op}: {amt}")
+        lines.append(f"公司合计: {sum(totals_company.values())}")
+    if totals_fleet:
+        lines.append("\n车队(群C):")
+        for op, amt in sorted(totals_fleet.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"{op}: {amt}")
+        lines.append(f"车队合计: {sum(totals_fleet.values())}")
+    # Removed overall total line per request
+    
+    # Net per user with explicit A-C=diff, ordered by company list first then remaining fleet-only users
+    if totals_company or totals_fleet:
+        lines.append("\n公司和车队的差别")
+        # Order: company users by amount desc, then fleet-only users by amount desc
+        ordered_users = [u for u, _ in sorted(totals_company.items(), key=lambda x: x[1], reverse=True)]
+        fleet_only = [u for u in totals_fleet.keys() if u not in totals_company]
+        ordered_users.extend([u for u, _ in sorted(((u, totals_fleet[u]) for u in fleet_only), key=lambda x: x[1], reverse=True)])
+        # Render
+        for user in ordered_users:
+            a = totals_company.get(user, 0)
+            c = totals_fleet.get(user, 0)
+            lines.append(f"{user}: {a}-{c}={a-c}")
+    return "\n".join(lines)
+
+def handle_finance_today_summary(update: Update, context: CallbackContext) -> None:
+    """财务计算业绩: List today operator totals for Group A (公司) and Group C (车队)."""
+    # Optional: restrict to authorized summary groups/admins
+    # if not is_summary_group_authorized(update.effective_chat.id):
+    #     return
+    today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
+    text = _finance_summary_for_date(today)
+    update.message.reply_text(text)
+
+def handle_finance_yesterday_summary(update: Update, context: CallbackContext) -> None:
+    """财务计算昨日业绩: Use archived data for yesterday."""
+    yesterday = (datetime.now(SINGAPORE_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+    text = _finance_summary_for_date(yesterday)
+    update.message.reply_text(text)
 
 # Define a helper function for consistent Group B mapping
 def get_group_b_for_image(image_id, metadata=None):
@@ -3009,6 +3215,33 @@ def handle_set_group_b(update: Update, context: CallbackContext) -> None:
         register_handlers(dispatcher)
     
     logger.info(f"Group {chat_id} set as Group B by user {user_id}")
+
+def handle_set_group_c(update: Update, context: CallbackContext) -> None:
+    """Handle setting a group as Group C (车队)."""
+    global dispatcher
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Only global admins
+    if not is_global_admin(user_id):
+        update.message.reply_text("只有全局管理员可以设置群聊C（车队）。")
+        return
+    
+    # Add to Group C set
+    GROUP_C_IDS.add(int(chat_id))
+    
+    # Store group name
+    if chat_id not in group_names and update.effective_chat.title:
+        group_names[chat_id] = update.effective_chat.title
+    
+    save_config_data()
+    
+    # Reload handlers (no specific filters here, but keep consistency)
+    if dispatcher:
+        register_handlers(dispatcher)
+    
+    update.message.reply_text("✅ 此群已设置为群聊C（车队）。")
+    logger.info(f"Group {chat_id} set as Group C by user {user_id}")
     # Notification removed
 
 def handle_promote_group_admin(update: Update, context: CallbackContext) -> None:
@@ -3730,6 +3963,13 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
+    # Alias: 设置刷新时间 HH:MM
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^设置刷新时间\s+\d{1,2}:\d{2}$'),
+        handle_set_bill_reset_time,
+        run_async=True
+    ))
+    
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'^导出昨日账单$'),
         handle_export_yesterday_bill,
@@ -3765,6 +4005,13 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'^设置群聊B$'),
         handle_set_group_b,
+        run_async=True
+    ))
+    
+    # Group C (车队) setup
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^设置车队$'),
+        handle_set_group_c,
         run_async=True
     ))
     
@@ -3868,6 +4115,37 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(MessageHandler(
         Filters.text & (Filters.regex(r'^开启转发$') | Filters.regex(r'^关闭转发$') | Filters.regex(r'^转发状态$')),
         handle_toggle_forwarding,
+        run_async=True
+    ))
+    
+    # Toggle accounting notify
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^开启记账提示$'),
+        lambda u, c: _toggle_accounting_notify(u, c, True),
+        run_async=True
+    ))
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^关闭记账提示$'),
+        lambda u, c: _toggle_accounting_notify(u, c, False),
+        run_async=True
+    ))
+    
+    # Personal performance command (Group B): 显示业绩
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^显示业绩$'),
+        handle_personal_performance,
+        run_async=True
+    ))
+    
+    # Finance summary commands (any admin in authorized summary group): 财务计算业绩 / 财务计算昨日业绩
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^财务计算业绩$'),
+        handle_finance_today_summary,
+        run_async=True
+    ))
+    dispatcher.add_handler(MessageHandler(
+        Filters.text & Filters.regex(r'^财务计算昨日业绩$'),
+        handle_finance_yesterday_summary,
         run_async=True
     ))
     
@@ -4478,14 +4756,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def check_and_reset_bills():
     """Check if any bills need to be reset based on their scheduled times."""
-    # Use Singapore timezone
-    singapore_now = datetime.now(SINGAPORE_TZ)
-    current_time = singapore_now.strftime("%H:%M")
-    current_date = singapore_now.strftime("%Y-%m-%d")
+    # Use Beijing timezone
+    beijing_now = datetime.now(SINGAPORE_TZ)
+    current_time = beijing_now.strftime("%H:%M")
+    current_date = beijing_now.strftime("%Y-%m-%d")
     
     # Only log every 10 minutes to reduce spam, or when there are groups to check
     if len(authorized_accounting_groups) > 0 and (current_time.endswith("0:00") or current_time.endswith("0:10") or current_time.endswith("0:20") or current_time.endswith("0:30") or current_time.endswith("0:40") or current_time.endswith("0:50")):
-        logger.info(f"Checking bill reset times at {current_time} (Singapore time) for {len(authorized_accounting_groups)} groups")
+        logger.info(f"Checking bill reset times at {current_time} (Beijing time) for {len(authorized_accounting_groups)} groups")
     
     # Check all authorized accounting groups
     for chat_id in authorized_accounting_groups:
@@ -4497,7 +4775,7 @@ def check_and_reset_bills():
         reset_time = bill_reset_times.get(chat_id, "00:00")  # Default to midnight
         
         if current_time == reset_time:
-            logger.info(f"🔄 Resetting bill for group {chat_id} at scheduled time {reset_time} (Singapore time) on {current_date}")
+            logger.info(f"🔄 Resetting bill for group {chat_id} at scheduled time {reset_time} (Beijing time) on {current_date}")
             archive_and_reset_bill(chat_id)
 
 def daily_cleanup():
@@ -4515,12 +4793,12 @@ def start_scheduler():
                 # Check bill resets every minute
                 check_and_reset_bills()
                 
-                # Check for daily cleanup at 01:00 Singapore time
+                # Check for daily cleanup at 01:00 Beijing time
                 current_time = datetime.now(SINGAPORE_TZ)
                 current_date = current_time.strftime("%Y-%m-%d")
                 current_hour_minute = current_time.strftime("%H:%M")
                 
-                # Run daily cleanup at 01:00 Singapore time once per day
+                # Run daily cleanup at 01:00 Beijing time once per day
                 if current_hour_minute == "01:00" and last_cleanup_date != current_date:
                     daily_cleanup()
                     last_cleanup_date = current_date
@@ -4919,11 +5197,11 @@ def handle_accounting_add_amount(update: Update, context: CallbackContext) -> No
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
-    # Check if group is authorized
-    if not is_accounting_authorized(chat_id):
-        return  # Silent ignore for unauthorized groups
+    # Check if group is authorized (Group A or Group C allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id)):
+        return  # Silent ignore for unauthorized chats
     
-    # Check if user is admin (only 操作人 can use accounting commands)
+    # Check if user is admin in respective group type
     if not (is_global_admin(user_id) or is_group_admin(user_id, chat_id)):
         update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
         return
@@ -4963,14 +5241,12 @@ def handle_accounting_add_amount(update: Update, context: CallbackContext) -> No
         operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
         add_transaction(chat_id, amount, user_info, 'deposit', operator)
         
-        # Generate and send updated bill with export button
-        bill = generate_bill(chat_id)
-        
-        # Add button to export current bill
-        keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(bill, reply_markup=reply_markup)
+        # Silent by default, unless notify is enabled for this group
+        if ACCOUNTING_NOTIFY.get(int(chat_id), False):
+            bill = generate_bill(chat_id)
+            keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            update.message.reply_text(bill, reply_markup=reply_markup)
         
         logger.info(f"Added deposit: +{amount} for {user_info} in group {chat_id}")
         
@@ -4986,11 +5262,11 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
-    # Check if group is authorized
-    if not is_accounting_authorized(chat_id):
-        return  # Silent ignore for unauthorized groups
+    # Check if group is authorized (Group A or Group C allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id)):
+        return  # Silent ignore for unauthorized chats
     
-    # Check if user is admin (only 操作人 can use accounting commands)
+    # Check if user is admin in respective group type
     if not (is_global_admin(user_id) or is_group_admin(user_id, chat_id)):
         update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
         return
@@ -5030,14 +5306,12 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
         operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
         add_transaction(chat_id, -amount, user_info, 'deposit', operator)
         
-        # Generate and send updated bill with export button
-        bill = generate_bill(chat_id)
-        
-        # Add button to export current bill
-        keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(bill, reply_markup=reply_markup)
+        # Silent by default, unless notify is enabled for this group
+        if ACCOUNTING_NOTIFY.get(int(chat_id), False):
+            bill = generate_bill(chat_id)
+            keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            update.message.reply_text(bill, reply_markup=reply_markup)
         
         logger.info(f"Added withdrawal: -{amount} for {user_info} in group {chat_id}")
         
