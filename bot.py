@@ -58,7 +58,7 @@ GROUP_B_IDS = set()  # Set of Group B chat IDs
 #     GROUP_B_IDS.add(GROUP_B_ID)
 
 # Admin system
-GLOBAL_ADMINS = set([5962096701, 1844353808, 7997704196, 5965182828, 19295597])  # Global admins with full permissions
+GLOBAL_ADMINS = set([5962096701, 1844353808, 7997704196, 5965182828])  # Global admins with full permissions
 GROUP_ADMINS = {}  # Format: {chat_id: set(user_ids)} - Group-specific admins
 
 # Message forwarding control
@@ -4077,7 +4077,7 @@ def register_handlers(dispatcher):
             Filters.text & Filters.chat(list(GROUP_B_IDS)),
             handle_all_group_b_messages,
             run_async=True
-        ))
+        ), group=1)
     
     # 7. Group A message handling
     # First admin replies with '群'
@@ -4132,22 +4132,22 @@ def register_handlers(dispatcher):
     
     # Personal performance command (Group B): 显示业绩
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^显示业绩$'),
+        Filters.text & Filters.regex(r'.*显示业绩.*'),
         handle_personal_performance,
         run_async=True
-    ))
+    ), group=0)
     
     # Finance summary commands (any admin in authorized summary group): 财务计算业绩 / 财务计算昨日业绩
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^财务计算业绩$'),
+        Filters.text & Filters.regex(r'.*财务计算业绩.*'),
         handle_finance_today_summary,
         run_async=True
-    ))
+    ), group=0)
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^财务计算昨日业绩$'),
+        Filters.text & Filters.regex(r'.*财务计算昨日业绩.*'),
         handle_finance_yesterday_summary,
         run_async=True
-    ))
+    ), group=0)
     
     # Add commands for forwarding control in private chat
     dispatcher.add_handler(CommandHandler("forwarding_on", handle_toggle_forwarding, Filters.chat_type.private))
