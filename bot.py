@@ -3970,6 +3970,19 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
+    # Photo with caption handlers for +amount/-amount
+    dispatcher.add_handler(MessageHandler(
+        Filters.photo & Filters.caption_regex(r'^\+\d+(\.\d+)?(\s+.*)?$'),
+        handle_accounting_add_amount_photo,
+        run_async=True
+    ))
+    
+    dispatcher.add_handler(MessageHandler(
+        Filters.photo & Filters.caption_regex(r'^-\d+(\.\d+)?(\s+.*)?$'),
+        handle_accounting_subtract_amount_photo,
+        run_async=True
+    ))
+    
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'^下发\d+(\.\d+)?(\s+.*)?$'),
         handle_accounting_distribute,
@@ -5356,6 +5369,134 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
         update.message.reply_text("❌ 金额格式错误。请输入有效数字。")
     except Exception as e:
         logger.error(f"Error in handle_accounting_subtract_amount: {e}")
+        update.message.reply_text("❌ 处理出款时发生错误。")
+
+def handle_accounting_add_amount_photo(update: Update, context: CallbackContext) -> None:
+    """Handle +金额 command in photo caption to add deposit."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    caption = update.message.caption.strip() if update.message.caption else ""
+    
+    # Check if group is authorized (Group A, Group C, or explicitly authorized allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id) or int(chat_id) in GROUP_A_IDS):
+        return  # Silent ignore for unauthorized chats
+    
+    # Check if user is admin in respective group type
+    if not (is_global_admin(user_id) or is_group_admin(user_id, chat_id)):
+        update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
+        return
+    
+    # Parse +amount format (no user info required)
+    if not caption.startswith('+'):
+        return
+    
+    try:
+        # Remove + and get content
+        content = caption[1:].strip()
+        parts = content.split(None, 1)
+        amount = float(parts[0])
+        
+        # Optional user info after amount
+        user_info = ""
+        if len(parts) > 1:
+            # Filter to only accept valid user info (starts with @ or is a name)
+            potential_user = parts[1].strip()
+            if potential_user.startswith('@') or (potential_user and not potential_user.replace('.', '').replace('-', '').isdigit()):
+                user_info = potential_user
+        
+        if not user_info and update.message.reply_to_message:
+            # Get user info from reply - prioritize name over username
+            replied_user = update.message.reply_to_message.from_user
+            user_info = replied_user.first_name or f"@{replied_user.username}" or "未知用户"
+        
+        # Store group name for future reference
+        if chat_id not in group_names and update.effective_chat.title:
+            group_names[chat_id] = update.effective_chat.title
+            save_config_data()
+        
+        # Add transaction - track operator (who added it) vs target user  
+        operator = (update.effective_user.first_name or 
+                   f"@{update.effective_user.username}" if update.effective_user.username else 
+                   f"用户{update.effective_user.id}")
+        add_transaction(chat_id, amount, user_info, 'deposit', operator)
+        
+        # Silent by default, unless notify is enabled for this group
+        if ACCOUNTING_NOTIFY.get(int(chat_id), False):
+            bill = generate_bill(chat_id)
+            keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            update.message.reply_text(bill, reply_markup=reply_markup)
+        
+        logger.info(f"Added deposit from photo: +{amount} for {user_info} in group {chat_id}")
+        
+    except ValueError:
+        update.message.reply_text("❌ 金额格式错误。请输入有效数字。")
+    except Exception as e:
+        logger.error(f"Error in handle_accounting_add_amount_photo: {e}")
+        update.message.reply_text("❌ 处理入款时发生错误。")
+
+def handle_accounting_subtract_amount_photo(update: Update, context: CallbackContext) -> None:
+    """Handle -金额 command in photo caption to subtract amount."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    caption = update.message.caption.strip() if update.message.caption else ""
+    
+    # Check if group is authorized (Group A, Group C, or explicitly authorized allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id) or int(chat_id) in GROUP_A_IDS):
+        return  # Silent ignore for unauthorized chats
+    
+    # Check if user is admin in respective group type
+    if not (is_global_admin(user_id) or is_group_admin(user_id, chat_id)):
+        update.message.reply_text("⚠️ 只有操作人可以使用记账功能。")
+        return
+    
+    # Parse -amount format (no user info required)
+    if not caption.startswith('-'):
+        return
+    
+    try:
+        # Remove - and get content
+        content = caption[1:].strip()
+        parts = content.split(None, 1)
+        amount = float(parts[0])
+        
+        # Optional user info after amount
+        user_info = ""
+        if len(parts) > 1:
+            # Filter to only accept valid user info (starts with @ or is a name)
+            potential_user = parts[1].strip()
+            if potential_user.startswith('@') or (potential_user and not potential_user.replace('.', '').replace('-', '').isdigit()):
+                user_info = potential_user
+        
+        if not user_info and update.message.reply_to_message:
+            # Get user info from reply - prioritize name over username
+            replied_user = update.message.reply_to_message.from_user
+            user_info = replied_user.first_name or f"@{replied_user.username}" or "未知用户"
+        
+        # Store group name for future reference
+        if chat_id not in group_names and update.effective_chat.title:
+            group_names[chat_id] = update.effective_chat.title
+            save_config_data()
+        
+        # Add negative transaction - track operator (who added it) vs target user
+        operator = (update.effective_user.first_name or 
+                   f"@{update.effective_user.username}" if update.effective_user.username else 
+                   f"用户{update.effective_user.id}")
+        add_transaction(chat_id, -amount, user_info, 'deposit', operator)
+        
+        # Silent by default, unless notify is enabled for this group
+        if ACCOUNTING_NOTIFY.get(int(chat_id), False):
+            bill = generate_bill(chat_id)
+            keyboard = [[InlineKeyboardButton("当前账单", callback_data=f"export_current_bill_{chat_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            update.message.reply_text(bill, reply_markup=reply_markup)
+        
+        logger.info(f"Added withdrawal from photo: -{amount} for {user_info} in group {chat_id}")
+        
+    except ValueError:
+        update.message.reply_text("❌ 金额格式错误。请输入有效数字。")
+    except Exception as e:
+        logger.error(f"Error in handle_accounting_subtract_amount_photo: {e}")
         update.message.reply_text("❌ 处理出款时发生错误。")
 
 def handle_accounting_distribute(update: Update, context: CallbackContext) -> None:
