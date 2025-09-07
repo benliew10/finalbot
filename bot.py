@@ -1436,6 +1436,31 @@ def _sum_operator_across_groups(date: str) -> Dict[str, int]:
                         totals[op] = totals.get(op, 0) + t['amount']
     return totals
 
+def _sum_operator_company_only(date: str) -> Dict[str, int]:
+    """Aggregate operator deposits across Group A (公司) only for a given date."""
+    totals: Dict[str, int] = {}
+    today_str = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
+    # Only include groups that are authorized AND in Group A
+    for group_id in authorized_accounting_groups:
+        if int(group_id) not in GROUP_A_IDS:
+            continue
+        # Today (in-memory)
+        if date == today_str and group_id in accounting_data:
+            for t in accounting_data[group_id]['transactions']:
+                if t['date'] == date and t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if op:
+                        totals[op] = totals.get(op, 0) + t['amount']
+        # Archived (for non-today dates)
+        if date != today_str and group_id in archived_bills and date in archived_bills[group_id]:
+            data = archived_bills[group_id][date]
+            for t in data['transactions']:
+                if t['amount'] > 0:
+                    op = t.get('operator') or ''
+                    if op:
+                        totals[op] = totals.get(op, 0) + t['amount']
+    return totals
+
 def handle_personal_performance(update: Update, context: CallbackContext) -> None:
     """显示业绩: user in Group B sees their own operator total across Group A + Group C for today."""
     user = update.effective_user
@@ -1449,9 +1474,10 @@ def handle_personal_performance(update: Update, context: CallbackContext) -> Non
     if not op_key:
         update.message.reply_text("无法识别操作者身份。请设置用户名或名字。")
         return
-    totals = _sum_operator_across_groups(today)
+    # Only show totals from 公司(群A)
+    totals = _sum_operator_company_only(today)
     amount = totals.get(op_key, 0)
-    update.message.reply_text(f"你的今日业绩：{amount}")
+    update.message.reply_text(f"你的今日公司业绩：{amount}")
 
 def _finance_summary_for_date(date: str) -> str:
     totals_company: Dict[str, int] = {}
