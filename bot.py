@@ -1471,7 +1471,10 @@ def handle_personal_performance(update: Update, context: CallbackContext) -> Non
     # if int(chat_id) not in GROUP_B_IDS:
     #     return
     today = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
-    op_key = f"@{user.username}" if user.username else (user.first_name or "")
+    # Use the same operator key format as in add_transaction
+    op_key = (user.first_name or 
+              f"@{user.username}" if user.username else 
+              f"用户{user.id}")
     if not op_key:
         update.message.reply_text("无法识别操作者身份。请设置用户名或名字。")
         return
@@ -3991,9 +3994,9 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # Alias: 设置刷新时间 HH:MM
+    # Alias: 设置刷新时间 HH:MM (allow optional space)
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^设置刷新时间\s+\d{1,2}:\d{2}$'),
+        Filters.text & Filters.regex(r'^设置刷新时间\s*\d{1,2}:\d{2}$'),
         handle_set_bill_reset_time,
         run_async=True
     ))
@@ -4098,25 +4101,25 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # 6. Performance and Finance commands (HIGH PRIORITY - before Group B catch-all)
+    # 6. Performance and Finance commands (HIGHEST PRIORITY - before all other handlers)
     # Personal performance command: 显示业绩
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'.*显示业绩.*'),
         handle_personal_performance,
         run_async=True
-    ), group=0)
+    ), group=-1)
     
     # Finance summary commands: 财务计算业绩 / 财务计算昨日业绩
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'.*财务计算业绩.*'),
         handle_finance_today_summary,
         run_async=True
-    ), group=0)
+    ), group=-1)
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'.*财务计算昨日业绩.*'),
         handle_finance_yesterday_summary,
         run_async=True
-    ), group=0)
+    ), group=-1)
     
     # 7. Group B message handling - single handler for everything (LOWER PRIORITY)
     # Updated to support multiple Group B chats
@@ -5267,8 +5270,10 @@ def handle_accounting_add_amount(update: Update, context: CallbackContext) -> No
             group_names[chat_id] = update.effective_chat.title
             save_config_data()
         
-        # Add transaction - track operator (who added it) vs target user
-        operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        # Add transaction - track operator (who added it) vs target user  
+        operator = (update.effective_user.first_name or 
+                   f"@{update.effective_user.username}" if update.effective_user.username else 
+                   f"用户{update.effective_user.id}")
         add_transaction(chat_id, amount, user_info, 'deposit', operator)
         
         # Silent by default, unless notify is enabled for this group
@@ -5333,7 +5338,9 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
             save_config_data()
         
         # Add negative transaction - track operator (who added it) vs target user
-        operator = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+        operator = (update.effective_user.first_name or 
+                   f"@{update.effective_user.username}" if update.effective_user.username else 
+                   f"用户{update.effective_user.id}")
         add_transaction(chat_id, -amount, user_info, 'deposit', operator)
         
         # Silent by default, unless notify is enabled for this group
