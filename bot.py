@@ -5227,8 +5227,8 @@ def handle_accounting_add_amount(update: Update, context: CallbackContext) -> No
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
-    # Check if group is authorized (Group A or Group C allowed)
-    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id)):
+    # Check if group is authorized (Group A, Group C, or explicitly authorized allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id) or int(chat_id) in GROUP_A_IDS):
         return  # Silent ignore for unauthorized chats
     
     # Check if user is admin in respective group type
@@ -5292,8 +5292,8 @@ def handle_accounting_subtract_amount(update: Update, context: CallbackContext) 
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
-    # Check if group is authorized (Group A or Group C allowed)
-    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id)):
+    # Check if group is authorized (Group A, Group C, or explicitly authorized allowed)
+    if not (is_accounting_authorized(chat_id) or is_group_c(chat_id) or int(chat_id) in GROUP_A_IDS):
         return  # Silent ignore for unauthorized chats
     
     # Check if user is admin in respective group type
