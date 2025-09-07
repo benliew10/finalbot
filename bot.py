@@ -1440,9 +1440,10 @@ def _sum_operator_company_only(date: str) -> Dict[str, int]:
     """Aggregate operator deposits across Group A (公司) only for a given date."""
     totals: Dict[str, int] = {}
     today_str = datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d")
-    # Only include groups that are authorized AND in Group A
-    for group_id in authorized_accounting_groups:
-        if int(group_id) not in GROUP_A_IDS:
+    # Include all Group A chats that have accounting data
+    for group_id in GROUP_A_IDS:
+        # Only process if this Group A has accounting data
+        if group_id not in accounting_data and group_id not in archived_bills:
             continue
         # Today (in-memory)
         if date == today_str and group_id in accounting_data:
@@ -1482,8 +1483,9 @@ def handle_personal_performance(update: Update, context: CallbackContext) -> Non
 def _finance_summary_for_date(date: str) -> str:
     totals_company: Dict[str, int] = {}
     totals_fleet: Dict[str, int] = {}
-    # Walk today/archived per group
-    for group_id in set(list(authorized_accounting_groups) + list(GROUP_C_IDS)):
+    # Walk today/archived per group - include all Group A and Group C chats that have accounting data
+    all_accounting_groups = set(list(authorized_accounting_groups) + list(GROUP_A_IDS) + list(GROUP_C_IDS))
+    for group_id in all_accounting_groups:
         # Today data
         if date == datetime.now(SINGAPORE_TZ).strftime("%Y-%m-%d") and group_id in accounting_data:
             for t in accounting_data[group_id]['transactions']:
